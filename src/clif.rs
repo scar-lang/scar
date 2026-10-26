@@ -30,11 +30,6 @@ pub fn compile_object(
     info: &ProgramInfo,
     optimize: bool,
 ) -> Result<NativeArtifact, CompileError> {
-    if !program.globals.is_empty() {
-        return Err(CompileError::new(
-            "native backend does not yet support globals",
-        ));
-    }
     let mut flag_builder = settings::builder();
     flag_builder
         .set("opt_level", if optimize { "speed" } else { "none" })
@@ -68,6 +63,7 @@ pub fn compile_object(
         reachable,
         function_ids: HashMap::new(),
         data_ids: HashMap::new(),
+        global_ids: HashMap::new(),
         strings: HashMap::new(),
         next_data: 0,
         next_block: 0,
@@ -75,6 +71,7 @@ pub fn compile_object(
 
     backend.declare_functions(program)?;
     backend.define_strings(program)?;
+    backend.declare_globals(program)?;
 
     for function in &program.functions {
         if function.extern_name.is_some() || !backend.reachable.contains(&function.name) {
@@ -101,6 +98,7 @@ struct Backend<'a> {
     reachable: std::collections::HashSet<String>,
     function_ids: HashMap<String, FuncId>,
     data_ids: HashMap<String, DataId>,
+    global_ids: HashMap<String, DataId>,
     strings: HashMap<String, (DataId, usize)>,
     next_data: usize,
     next_block: usize,
@@ -110,6 +108,7 @@ struct Backend<'a> {
 struct LoopContext {
     break_block: ir::Block,
     continue_block: ir::Block,
+    defer_depth: usize,
 }
 
 struct FunctionScope {
@@ -118,6 +117,14 @@ struct FunctionScope {
     return_block: ir::Block,
     loops: Vec<LoopContext>,
     temp_slots: HashMap<String, ir::StackSlot>,
+    defer_stack: Vec<Vec<Stmt>>,
+}
+
+#[derive(Clone)]
+struct ResultLayout {
+    ok_offset: u64,
+    error_offset: u64,
+    size: u64,
 }
 
 impl<'a> Backend<'a> {
@@ -170,6 +177,27 @@ impl<'a> Backend<'a> {
         Ok(())
     }
 
+    fn declare_globals(&mut self, program: &Program) -> Result<(), CompileError> {
+        for global in &program.globals {
+            let name = format!("__scar_global_{}", global.name);
+            let data_id = self
+                .module
+                .declare_data(&name, Linkage::Export, false, false)
+                .map_err(|e| {
+                    CompileError::new(format!("failed to declare global `{}`: {e}", global.name))
+                })?;
+            let (size, align) = self.value_size_align(&global.ty)?;
+            let mut desc = DataDescription::new();
+            desc.define_zeroinit(size.max(1) as usize);
+            desc.set_align(align.max(1));
+            self.module.define_data(data_id, &desc).map_err(|e| {
+                CompileError::new(format!("failed to define global `{}`: {e}", global.name))
+            })?;
+            self.global_ids.insert(global.name.clone(), data_id);
+        }
+        Ok(())
+    }
+
     fn define_entrypoint(&mut self, program: &Program) -> Result<(), CompileError> {
         let Some(main_function) = program
             .functions
@@ -192,10 +220,66 @@ impl<'a> Backend<'a> {
         let mut builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
         let entry = builder.create_block();
+        self.info.scope_overrides.borrow_mut().clear();
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         builder.seal_block(entry);
         builder.ins().nop();
+
+        let entry_params = builder.block_params(entry).to_vec();
+        if let (Some(argc), Some(argv)) =
+            (entry_params.first().copied(), entry_params.get(1).copied())
+        {
+            let set_args = self.extern_function(
+                "scar_set_args",
+                &[
+                    Type::I32,
+                    Type::Ref(Box::new(Type::Ref(Box::new(Type::U8)))),
+                ],
+                &Type::Void,
+            )?;
+            let func_ref = self.module.declare_func_in_func(set_args, builder.func);
+            let _ = builder.ins().call(func_ref, &[argc, argv]);
+        }
+
+        let dummy_function = Function {
+            is_pub: false,
+            name: String::new(),
+            extern_name: None,
+            generic_params: Vec::new(),
+            params: Vec::new(),
+            return_type: Type::Void,
+            body: Vec::new(),
+            line: 0,
+            column: 0,
+            file_path: None,
+        };
+        let mut init_scope = FunctionScope {
+            vars: HashMap::new(),
+            return_var: None,
+            return_block: entry,
+            loops: Vec::new(),
+            temp_slots: HashMap::new(),
+            defer_stack: Vec::new(),
+        };
+        for global in &program.globals {
+            let Some(data_id) = self.global_ids.get(&global.name).copied() else {
+                continue;
+            };
+            let gv = self.module.declare_data_in_func(data_id, builder.func);
+            let address = builder.ins().global_value(self.pointer_type, gv);
+            let clif_ty = self.type_of(&global.ty)?;
+            let value = self.emit_expr(
+                &mut builder,
+                &global.init,
+                Some(&global.ty),
+                &dummy_function,
+                &mut init_scope,
+            )?;
+            let value = self.coerce_value(&mut builder, value, clif_ty, &global.ty)?;
+            builder.ins().store(MemFlags::new(), value, address, 0);
+        }
+
         let function_id = *self
             .function_ids
             .get(&main_function.name)
@@ -203,16 +287,61 @@ impl<'a> Backend<'a> {
         let func_ref = self.module.declare_func_in_func(function_id, builder.func);
         let call = builder.ins().call(func_ref, &[]);
         let result = builder.inst_results(call).first().copied();
-        let value = match result {
-            Some(value) if !matches!(main_function.return_type, Type::Void) => value,
-            _ => builder.ins().iconst(types::I32, 0),
-        };
-        let value = if matches!(main_function.return_type, Type::Void) {
-            builder.ins().iconst(types::I32, 0)
+        let return_type =
+            crate::codegen::resolve_codegen_aliases(&main_function.return_type, self.info)?;
+        if let Type::Result(ok_ty) = return_type {
+            let layout = self.result_layout(&ok_ty)?;
+            let result_ptr = result.ok_or_else(|| {
+                CompileError::new("main returned a result without a value in native backend")
+            })?;
+            let is_error = builder
+                .ins()
+                .load(types::I32, MemFlags::new(), result_ptr, 0);
+            let error_block = self.new_block(&mut builder);
+            let ok_block = self.new_block(&mut builder);
+            builder
+                .ins()
+                .brif(is_error, error_block, &[], ok_block, &[]);
+            builder.switch_to_block(error_block);
+            builder.seal_block(error_block);
+            let message = builder.ins().load(
+                self.pointer_type,
+                MemFlags::new(),
+                result_ptr,
+                layout.error_offset as i32,
+            );
+            let panic = self.extern_function(
+                "scar_runtime_panic",
+                &[Type::Ref(Box::new(Type::U8))],
+                &Type::Void,
+            )?;
+            let panic_ref = self.module.declare_func_in_func(panic, builder.func);
+            let _ = builder.ins().call(panic_ref, &[message]);
+            builder.ins().trap(ir::TrapCode::user(1).unwrap());
+            builder.switch_to_block(ok_block);
+            builder.seal_block(ok_block);
+            let value = if ok_ty.as_ref() == &Type::Void {
+                builder.ins().iconst(types::I32, 0)
+            } else {
+                let ok_clif_ty = self.type_of(&ok_ty)?;
+                let ok_value = builder.ins().load(
+                    ok_clif_ty,
+                    MemFlags::new(),
+                    result_ptr,
+                    layout.ok_offset as i32,
+                );
+                self.coerce_value(&mut builder, ok_value, types::I32, &ok_ty)?
+            };
+            builder.ins().return_(&[value]);
         } else {
-            self.coerce_value(&mut builder, value, types::I32, &main_function.return_type)?
-        };
-        builder.ins().return_(&[value]);
+            let value = if matches!(main_function.return_type, Type::Void) {
+                builder.ins().iconst(types::I32, 0)
+            } else {
+                let value = result.unwrap_or_else(|| builder.ins().iconst(types::I32, 0));
+                self.coerce_value(&mut builder, value, types::I32, &main_function.return_type)?
+            };
+            builder.ins().return_(&[value]);
+        }
         builder.finalize();
         self.module
             .define_function(main_id, &mut ctx)
@@ -231,6 +360,7 @@ impl<'a> Backend<'a> {
         let mut builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
         let entry = builder.create_block();
+        self.info.scope_overrides.borrow_mut().clear();
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         builder.seal_block(entry);
@@ -247,15 +377,21 @@ impl<'a> Backend<'a> {
         };
 
         if let Some((var, return_ty)) = return_var.clone() {
-            let ty = self.type_of(&return_ty)?;
-            let zero = if ty.is_float() {
-                if ty == types::F32 {
-                    builder.ins().f32const(0.0)
-                } else {
-                    builder.ins().f64const(0.0)
-                }
+            let resolved_return = crate::codegen::resolve_codegen_aliases(&return_ty, self.info)?;
+            let zero = if let Type::Result(ok_ty) = resolved_return {
+                let layout = self.result_layout(&ok_ty)?;
+                self.emit_calloc(&mut builder, layout.size)?
             } else {
-                builder.ins().iconst(ty, 0)
+                let ty = self.type_of(&return_ty)?;
+                if ty.is_float() {
+                    if ty == types::F32 {
+                        builder.ins().f32const(0.0)
+                    } else {
+                        builder.ins().f64const(0.0)
+                    }
+                } else {
+                    builder.ins().iconst(ty, 0)
+                }
             };
             builder.def_var(var, zero);
         }
@@ -266,6 +402,7 @@ impl<'a> Backend<'a> {
             return_block,
             loops: Vec::new(),
             temp_slots: HashMap::new(),
+            defer_stack: Vec::new(),
         };
 
         let params = builder.block_params(entry).to_vec();
@@ -278,7 +415,14 @@ impl<'a> Backend<'a> {
                 .insert(param.name.clone(), (var, param.ty.clone()));
         }
 
-        self.emit_block(&mut builder, &function.body, function, &mut scope)?;
+        self.emit_block(&mut builder, &function.body, function, &mut scope)
+            .map_err(|error| {
+                CompileError::new(format!(
+                    "failed to compile function `{}`: {}",
+                    function.name,
+                    error.message()
+                ))
+            })?;
         if !current_block_terminated(&builder) {
             if let Some((return_var, _)) = scope.return_var.clone() {
                 let value = builder.use_var(return_var);
@@ -301,7 +445,7 @@ impl<'a> Backend<'a> {
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
                 CompileError::new(format!(
-                    "failed to compile function `{}`: {e}",
+                    "failed to compile function `{}`: {e:?}",
                     function.name
                 ))
             })?;
@@ -338,11 +482,80 @@ impl<'a> Backend<'a> {
         function: &Function,
         scope: &mut FunctionScope,
     ) -> Result<(), CompileError> {
+        scope.defer_stack.push(Vec::new());
         for stmt in body {
             if current_block_terminated(builder) {
                 break;
             }
+            if let Stmt::Defer {
+                body: defer_body, ..
+            } = stmt
+            {
+                scope
+                    .defer_stack
+                    .last_mut()
+                    .unwrap()
+                    .extend(defer_body.clone());
+            } else {
+                self.emit_stmt(builder, stmt, function, scope)?;
+            }
+        }
+        if !current_block_terminated(builder) {
+            self.emit_current_defers(builder, function, scope)?;
+        }
+        scope.defer_stack.pop();
+        Ok(())
+    }
+
+    fn emit_current_defers(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<(), CompileError> {
+        let group = scope.defer_stack.last().cloned().unwrap_or_default();
+        for stmt in group.iter().rev() {
+            if current_block_terminated(builder) {
+                break;
+            }
             self.emit_stmt(builder, stmt, function, scope)?;
+        }
+        Ok(())
+    }
+
+    fn emit_all_defers(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<(), CompileError> {
+        let groups = scope.defer_stack.clone();
+        for group in groups.iter().rev() {
+            for stmt in group.iter().rev() {
+                if current_block_terminated(builder) {
+                    return Ok(());
+                }
+                self.emit_stmt(builder, stmt, function, scope)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_defers_from(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        function: &Function,
+        scope: &mut FunctionScope,
+        depth: usize,
+    ) -> Result<(), CompileError> {
+        let groups = scope.defer_stack.clone();
+        for group in groups.iter().skip(depth).rev() {
+            for stmt in group.iter().rev() {
+                if current_block_terminated(builder) {
+                    return Ok(());
+                }
+                self.emit_stmt(builder, stmt, function, scope)?;
+            }
         }
         Ok(())
     }
@@ -355,11 +568,7 @@ impl<'a> Backend<'a> {
         scope: &mut FunctionScope,
     ) -> Result<(), CompileError> {
         match stmt {
-            Stmt::Defer { .. } => {
-                return Err(CompileError::new(
-                    "native backend does not yet support defer; use -c for the C backend",
-                ));
-            }
+            Stmt::Defer { .. } => {} // Collected by emit_block.
             Stmt::VarDecl {
                 mutable: _,
                 name,
@@ -382,7 +591,7 @@ impl<'a> Backend<'a> {
                 let value = self.coerce_value(builder, value, clif_ty, &ty)?;
                 let var = builder.declare_var(clif_ty);
                 builder.def_var(var, value);
-                scope.vars.insert(name.clone(), (var, ty));
+                self.bind_var(scope, name.clone(), var, ty);
             }
             Stmt::Assign { target, value, .. } => {
                 let target_ty = infer_codegen_expr_type(target, function, self.info)?;
@@ -457,26 +666,68 @@ impl<'a> Backend<'a> {
                     scope,
                 )?
             }
-            Stmt::Assert { .. } => {
-                return Err(CompileError::new(
-                    "native backend does not yet support assertions; use -c for the C backend",
-                ));
+            Stmt::Assert {
+                line,
+                column,
+                condition,
+            } => {
+                let cond = self.emit_expr(builder, condition, None, function, scope)?;
+                let cond = self.to_bool(builder, cond)?;
+                let ok_block = self.new_block(builder);
+                let fail_block = self.new_block(builder);
+                builder.ins().brif(cond, ok_block, &[], fail_block, &[]);
+                builder.switch_to_block(fail_block);
+                builder.seal_block(fail_block);
+                let message = format!(
+                    "assertion failed in {} at {}:{}",
+                    function.name, line, column
+                );
+                let (data_id, _) = self.intern_string(&message)?;
+                let gv = self.module.declare_data_in_func(data_id, builder.func);
+                let pointer = builder.ins().global_value(self.pointer_type, gv);
+                let panic = self.extern_function(
+                    "scar_runtime_panic",
+                    &[Type::Ref(Box::new(Type::U8))],
+                    &Type::Void,
+                )?;
+                let panic_ref = self.module.declare_func_in_func(panic, builder.func);
+                let _ = builder.ins().call(panic_ref, &[pointer]);
+                builder.ins().trap(ir::TrapCode::user(1).unwrap());
+                builder.switch_to_block(ok_block);
+                builder.seal_block(ok_block);
             }
             Stmt::Return { value, .. } => {
                 let Some((return_var, return_ty)) = scope.return_var.clone() else {
+                    self.emit_all_defers(builder, function, scope)?;
                     builder.ins().return_(&[]);
                     return Ok(());
                 };
+                let resolved_return =
+                    crate::codegen::resolve_codegen_aliases(&return_ty, self.info)?;
                 let value = match value {
                     Some(value) => {
                         self.emit_expr(builder, value, Some(&return_ty), function, scope)?
                     }
-                    None => builder.ins().iconst(types::I32, 0),
+                    None => {
+                        if let Type::Result(ok_ty) = resolved_return {
+                            let ok_value = if ok_ty.as_ref() == &Type::Void {
+                                None
+                            } else {
+                                Some(self.emit_zeroed_value(builder, &ok_ty, function, scope)?)
+                            };
+                            self.emit_result_ok(builder, &ok_ty, ok_value)?
+                        } else {
+                            builder.ins().iconst(types::I32, 0)
+                        }
+                    }
                 };
                 let clif_ty = self.type_of(&return_ty)?;
                 let value = self.coerce_value(builder, value, clif_ty, &return_ty)?;
                 builder.def_var(return_var, value);
-                builder.ins().jump(scope.return_block, &[value.into()]);
+                self.emit_all_defers(builder, function, scope)?;
+                if !current_block_terminated(builder) {
+                    builder.ins().jump(scope.return_block, &[value.into()]);
+                }
             }
             Stmt::Block(body) => self.emit_block(builder, body, function, scope)?,
             Stmt::If {
@@ -506,10 +757,8 @@ impl<'a> Backend<'a> {
                 builder.switch_to_block(merge_block);
                 builder.seal_block(merge_block);
             }
-            Stmt::Match { .. } => {
-                return Err(CompileError::new(
-                    "native backend does not yet support match; use -c for the C backend",
-                ));
+            Stmt::Match { expr, arms, .. } => {
+                self.emit_match(builder, expr, arms, function, scope)?;
             }
             Stmt::Expr { expr, .. } => {
                 if matches!(expr, Expr::Pack(_)) {
@@ -524,11 +773,12 @@ impl<'a> Backend<'a> {
                 body,
                 ..
             } => self.emit_for_range(builder, var_name, start, end, body, function, scope)?,
-            Stmt::ForEach { .. } => {
-                return Err(CompileError::new(
-                    "native backend does not yet support for-each; use -c for the C backend",
-                ));
-            }
+            Stmt::ForEach {
+                var_name,
+                iterable,
+                body,
+                ..
+            } => self.emit_for_each(builder, var_name, iterable, body, function, scope)?,
             Stmt::ForClassic {
                 var_name,
                 init,
@@ -552,9 +802,11 @@ impl<'a> Backend<'a> {
                 builder.ins().brif(cond, body_block, &[], after_block, &[]);
                 builder.switch_to_block(body_block);
                 builder.seal_block(body_block);
+                let defer_depth = scope.defer_stack.len();
                 scope.loops.push(LoopContext {
                     break_block: after_block,
                     continue_block: cond_block,
+                    defer_depth,
                 });
                 self.emit_block(builder, body, function, scope)?;
                 scope.loops.pop();
@@ -570,9 +822,11 @@ impl<'a> Backend<'a> {
                 let after_block = self.new_block(builder);
                 builder.ins().jump(body_block, &[]);
                 builder.switch_to_block(body_block);
+                let defer_depth = scope.defer_stack.len();
                 scope.loops.push(LoopContext {
                     break_block: after_block,
                     continue_block: body_block,
+                    defer_depth,
                 });
                 self.emit_block(builder, body, function, scope)?;
                 scope.loops.pop();
@@ -589,7 +843,10 @@ impl<'a> Backend<'a> {
                     .last()
                     .copied()
                     .ok_or_else(|| CompileError::new("continue outside of a loop"))?;
-                builder.ins().jump(ctx.continue_block, &[]);
+                self.emit_defers_from(builder, function, scope, ctx.defer_depth)?;
+                if !current_block_terminated(builder) {
+                    builder.ins().jump(ctx.continue_block, &[]);
+                }
             }
             Stmt::Break { .. } => {
                 let ctx = scope
@@ -597,7 +854,10 @@ impl<'a> Backend<'a> {
                     .last()
                     .copied()
                     .ok_or_else(|| CompileError::new("break outside of a loop"))?;
-                builder.ins().jump(ctx.break_block, &[]);
+                self.emit_defers_from(builder, function, scope, ctx.defer_depth)?;
+                if !current_block_terminated(builder) {
+                    builder.ins().jump(ctx.break_block, &[]);
+                }
             }
         }
         Ok(())
@@ -627,9 +887,7 @@ impl<'a> Backend<'a> {
         let end_value = self.coerce_value(builder, end_value, clif_ty, &var_ty)?;
         let var = builder.declare_var(clif_ty);
         builder.def_var(var, start_value);
-        scope
-            .vars
-            .insert(var_name.to_string(), (var, var_ty.clone()));
+        self.bind_var(scope, var_name.to_string(), var, var_ty.clone());
         let cond_block = self.new_block(builder);
         let body_block = self.new_block(builder);
         let inc_block = self.new_block(builder);
@@ -650,9 +908,11 @@ impl<'a> Backend<'a> {
         builder.ins().brif(cond, body_block, &[], after_block, &[]);
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
+        let defer_depth = scope.defer_stack.len();
         scope.loops.push(LoopContext {
             break_block: after_block,
             continue_block: inc_block,
+            defer_depth,
         });
         self.emit_block(builder, body, function, scope)?;
         scope.loops.pop();
@@ -695,7 +955,7 @@ impl<'a> Backend<'a> {
         let init_value = self.coerce_value(builder, init_value, clif_ty, &var_ty)?;
         let var = builder.declare_var(clif_ty);
         builder.def_var(var, init_value);
-        scope.vars.insert(var_name.to_string(), (var, var_ty));
+        self.bind_var(scope, var_name.to_string(), var, var_ty);
         let cond_block = self.new_block(builder);
         let body_block = self.new_block(builder);
         let inc_block = self.new_block(builder);
@@ -707,9 +967,11 @@ impl<'a> Backend<'a> {
         builder.ins().brif(cond, body_block, &[], after_block, &[]);
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
+        let defer_depth = scope.defer_stack.len();
         scope.loops.push(LoopContext {
             break_block: after_block,
             continue_block: inc_block,
+            defer_depth,
         });
         self.emit_block(builder, body, function, scope)?;
         scope.loops.pop();
@@ -723,6 +985,504 @@ impl<'a> Backend<'a> {
         builder.seal_block(cond_block);
         builder.switch_to_block(after_block);
         builder.seal_block(after_block);
+        Ok(())
+    }
+
+    fn emit_for_each(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        var_name: &str,
+        iterable: &Expr,
+        body: &[Stmt],
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<(), CompileError> {
+        let iterable_ty = crate::codegen::resolve_codegen_aliases(
+            &infer_codegen_expr_type(iterable, function, self.info)?,
+            self.info,
+        )?;
+        let element_ty = match crate::codegen::deref_refs(&iterable_ty) {
+            Type::List(element) => (**element).clone(),
+            other => {
+                return Err(CompileError::new(format!(
+                    "`for ... in ...` requires a list iterable in native code generation, got {}",
+                    describe_type(other)
+                )));
+            }
+        };
+        let header = self.emit_expr(builder, iterable, Some(&iterable_ty), function, scope)?;
+        let element_clif_ty = self.type_of(&element_ty)?;
+        let index_ty = types::I32;
+        let index_var = builder.declare_var(index_ty);
+        let zero = builder.ins().iconst(index_ty, 0);
+        builder.def_var(index_var, zero);
+        let element_var = builder.declare_var(element_clif_ty);
+        self.bind_var(scope, var_name.to_string(), element_var, element_ty.clone());
+        let (element_size, _) = self.value_size_align(&element_ty)?;
+        let element_size = element_size.max(1);
+        let len_offset = (self.pointer_type.bits() / 8) as i32;
+        let cond_block = self.new_block(builder);
+        let body_block = self.new_block(builder);
+        let inc_block = self.new_block(builder);
+        let after_block = self.new_block(builder);
+        builder.ins().jump(cond_block, &[]);
+        builder.switch_to_block(cond_block);
+        let length = builder
+            .ins()
+            .load(index_ty, MemFlags::new(), header, len_offset);
+        let index = builder.use_var(index_var);
+        let cond = builder
+            .ins()
+            .icmp(ir::condcodes::IntCC::SignedLessThan, index, length);
+        builder.ins().brif(cond, body_block, &[], after_block, &[]);
+        builder.switch_to_block(body_block);
+        builder.seal_block(body_block);
+        let data = builder
+            .ins()
+            .load(self.pointer_type, MemFlags::new(), header, 0);
+        let index = builder.use_var(index_var);
+        let index_wide = self.coerce_value(builder, index, self.pointer_type, &Type::Usize)?;
+        let stride = builder.ins().iconst(self.pointer_type, element_size as i64);
+        let offset = builder.ins().imul(index_wide, stride);
+        let address = builder.ins().iadd(data, offset);
+        let element = builder
+            .ins()
+            .load(element_clif_ty, MemFlags::new(), address, 0);
+        builder.def_var(element_var, element);
+        let defer_depth = scope.defer_stack.len();
+        scope.loops.push(LoopContext {
+            break_block: after_block,
+            continue_block: inc_block,
+            defer_depth,
+        });
+        self.emit_block(builder, body, function, scope)?;
+        scope.loops.pop();
+        if !current_block_terminated(builder) {
+            builder.ins().jump(inc_block, &[]);
+        }
+        builder.switch_to_block(inc_block);
+        builder.seal_block(inc_block);
+        let index = builder.use_var(index_var);
+        let one = builder.ins().iconst(index_ty, 1);
+        let next = builder.ins().iadd(index, one);
+        builder.def_var(index_var, next);
+        builder.ins().jump(cond_block, &[]);
+        builder.seal_block(cond_block);
+        builder.switch_to_block(after_block);
+        builder.seal_block(after_block);
+        Ok(())
+    }
+
+    fn emit_match(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &Expr,
+        arms: &[crate::ast::MatchArm],
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<(), CompileError> {
+        let matched_ty = crate::codegen::resolve_codegen_aliases(
+            &infer_codegen_expr_type(expr, function, self.info)?,
+            self.info,
+        )?;
+        match matched_ty {
+            Type::Result(_) => self.emit_match_result(builder, expr, arms, function, scope),
+            Type::Named(name) => {
+                let kind = self
+                    .info
+                    .types
+                    .get(&name)
+                    .map(|type_info| type_info.kind)
+                    .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
+                match kind {
+                    TypeDefKind::Enum => {
+                        self.emit_match_enum(builder, expr, &name, arms, function, scope)
+                    }
+                    TypeDefKind::Union => {
+                        self.emit_match_union(builder, expr, &name, arms, function, scope)
+                    }
+                    TypeDefKind::Struct => Err(CompileError::new(
+                        "`match` requires a union, enum, or result value in native code generation",
+                    )),
+                }
+            }
+            Type::Applied(name, _) => {
+                let kind = self
+                    .info
+                    .types
+                    .get(&name)
+                    .map(|type_info| type_info.kind)
+                    .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
+                match kind {
+                    TypeDefKind::Enum => {
+                        self.emit_match_enum(builder, expr, &name, arms, function, scope)
+                    }
+                    TypeDefKind::Union => {
+                        self.emit_match_union(builder, expr, &name, arms, function, scope)
+                    }
+                    TypeDefKind::Struct => Err(CompileError::new(
+                        "`match` requires a union, enum, or result value in native code generation",
+                    )),
+                }
+            }
+            Type::F32 | Type::F64 => {
+                self.emit_match_scalar(builder, expr, arms, true, function, scope)
+            }
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::Isize
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Usize => self.emit_match_scalar(builder, expr, arms, false, function, scope),
+            other => Err(CompileError::new(format!(
+                "`match` requires a union, enum, integer, float, or result value in native code generation, got {}",
+                describe_type(&other)
+            ))),
+        }
+    }
+
+    fn emit_match_result(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &Expr,
+        arms: &[crate::ast::MatchArm],
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<(), CompileError> {
+        let matched_ty = crate::codegen::resolve_codegen_aliases(
+            &infer_codegen_expr_type(expr, function, self.info)?,
+            self.info,
+        )?;
+        let Type::Result(ok_ty) = matched_ty else {
+            return Err(CompileError::new(
+                "`match` result arm requires a result value in native code generation",
+            ));
+        };
+        let layout = self.result_layout(&ok_ty)?;
+        let pointer = self.emit_expr(builder, expr, None, function, scope)?;
+        let is_error = builder.ins().load(types::I32, MemFlags::new(), pointer, 0);
+        let ok_arm = arms
+            .iter()
+            .find(|arm| matches!(arm.kind, crate::ast::MatchArmKind::Ok));
+        let error_arm = arms
+            .iter()
+            .find(|arm| matches!(arm.kind, crate::ast::MatchArmKind::Error));
+        let (Some(ok_arm), Some(error_arm)) = (ok_arm, error_arm) else {
+            return Err(CompileError::new(
+                "result matches require both `ok` and `error` arms in native code generation",
+            ));
+        };
+        let ok_block = self.new_block(builder);
+        let error_block = self.new_block(builder);
+        let merge_block = self.new_block(builder);
+        builder
+            .ins()
+            .brif(is_error, error_block, &[], ok_block, &[]);
+
+        builder.switch_to_block(ok_block);
+        builder.seal_block(ok_block);
+        let saved = scope.vars.clone();
+        let saved_overrides = self.info.scope_overrides.borrow().clone();
+        if let Some(binding) = ok_arm.bindings.first().and_then(|binding| binding.as_ref()) {
+            if ok_ty.as_ref() != &Type::Void {
+                let clif_ty = self.type_of(&ok_ty)?;
+                let value =
+                    builder
+                        .ins()
+                        .load(clif_ty, MemFlags::new(), pointer, layout.ok_offset as i32);
+                let var = builder.declare_var(clif_ty);
+                builder.def_var(var, value);
+                self.bind_var(scope, binding.clone(), var, (*ok_ty).clone());
+            }
+        }
+        self.emit_block(builder, &ok_arm.body, function, scope)?;
+        scope.vars = saved;
+        *self.info.scope_overrides.borrow_mut() = saved_overrides;
+        if !current_block_terminated(builder) {
+            builder.ins().jump(merge_block, &[]);
+        }
+
+        builder.switch_to_block(error_block);
+        builder.seal_block(error_block);
+        let saved = scope.vars.clone();
+        let saved_overrides = self.info.scope_overrides.borrow().clone();
+        if let Some(binding) = error_arm
+            .bindings
+            .first()
+            .and_then(|binding| binding.as_ref())
+        {
+            let message = builder.ins().load(
+                self.pointer_type,
+                MemFlags::new(),
+                pointer,
+                layout.error_offset as i32,
+            );
+            let var = builder.declare_var(self.pointer_type);
+            builder.def_var(var, message);
+            self.bind_var(scope, binding.clone(), var, Type::Ref(Box::new(Type::U8)));
+        }
+        self.emit_block(builder, &error_arm.body, function, scope)?;
+        scope.vars = saved;
+        *self.info.scope_overrides.borrow_mut() = saved_overrides;
+        if !current_block_terminated(builder) {
+            builder.ins().jump(merge_block, &[]);
+        }
+
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        Ok(())
+    }
+
+    fn emit_match_enum(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &Expr,
+        enum_name: &str,
+        arms: &[crate::ast::MatchArm],
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<(), CompileError> {
+        let type_info = self
+            .info
+            .types
+            .get(enum_name)
+            .ok_or_else(|| CompileError::new(format!("unknown type `{enum_name}`")))?;
+        let value = self.emit_expr(builder, expr, None, function, scope)?;
+        let merge_block = self.new_block(builder);
+        let mut has_wildcard = false;
+        for arm in arms {
+            let crate::ast::MatchArmKind::Variant(variant_name) = &arm.kind else {
+                return Err(CompileError::new(
+                    "enum matches require variant arms in native code generation",
+                ));
+            };
+            let bare = variant_name.rsplit('.').next().unwrap_or(variant_name);
+            if bare == "_" {
+                let saved = scope.vars.clone();
+                let saved_overrides = self.info.scope_overrides.borrow().clone();
+                self.emit_block(builder, &arm.body, function, scope)?;
+                scope.vars = saved;
+                *self.info.scope_overrides.borrow_mut() = saved_overrides;
+                if !current_block_terminated(builder) {
+                    builder.ins().jump(merge_block, &[]);
+                }
+                has_wildcard = true;
+                break;
+            }
+            let index = type_info
+                .variants
+                .iter()
+                .position(|variant| variant.name == bare)
+                .ok_or_else(|| {
+                    CompileError::new(format!("enum `{enum_name}` has no variant `{bare}`"))
+                })? as i64;
+            let body_block = self.new_block(builder);
+            let next_block = self.new_block(builder);
+            let constant = builder.ins().iconst(types::I32, index);
+            let cond = builder
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, value, constant);
+            builder.ins().brif(cond, body_block, &[], next_block, &[]);
+            builder.switch_to_block(body_block);
+            builder.seal_block(body_block);
+            let saved = scope.vars.clone();
+            let saved_overrides = self.info.scope_overrides.borrow().clone();
+            self.emit_block(builder, &arm.body, function, scope)?;
+            scope.vars = saved;
+            *self.info.scope_overrides.borrow_mut() = saved_overrides;
+            if !current_block_terminated(builder) {
+                builder.ins().jump(merge_block, &[]);
+            }
+            builder.switch_to_block(next_block);
+            builder.seal_block(next_block);
+        }
+        if !has_wildcard {
+            builder.ins().jump(merge_block, &[]);
+        }
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        Ok(())
+    }
+
+    fn emit_match_union(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &Expr,
+        union_name: &str,
+        arms: &[crate::ast::MatchArm],
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<(), CompileError> {
+        let type_info = self
+            .info
+            .types
+            .get(union_name)
+            .ok_or_else(|| CompileError::new(format!("unknown type `{union_name}`")))?;
+        let pointer = self.emit_expr(builder, expr, None, function, scope)?;
+        let tag = builder.ins().load(types::I32, MemFlags::new(), pointer, 0);
+        let data_offset = self.union_data_offset(union_name)?;
+        let merge_block = self.new_block(builder);
+        let mut has_wildcard = false;
+        for arm in arms {
+            let crate::ast::MatchArmKind::Variant(variant_name) = &arm.kind else {
+                return Err(CompileError::new(
+                    "union matches require variant arms in native code generation",
+                ));
+            };
+            let bare = variant_name.rsplit('.').next().unwrap_or(variant_name);
+            if bare == "_" {
+                let saved = scope.vars.clone();
+                let saved_overrides = self.info.scope_overrides.borrow().clone();
+                self.emit_block(builder, &arm.body, function, scope)?;
+                scope.vars = saved;
+                *self.info.scope_overrides.borrow_mut() = saved_overrides;
+                if !current_block_terminated(builder) {
+                    builder.ins().jump(merge_block, &[]);
+                }
+                has_wildcard = true;
+                break;
+            }
+            let index = type_info
+                .variants
+                .iter()
+                .position(|variant| variant.name == bare)
+                .ok_or_else(|| {
+                    CompileError::new(format!("union `{union_name}` has no variant `{bare}`"))
+                })? as i64;
+            let payload_types = type_info.variant_map.get(bare).cloned().unwrap_or_default();
+            let (_, _, offsets) = self.variant_payload_layout(union_name, bare)?;
+            let body_block = self.new_block(builder);
+            let next_block = self.new_block(builder);
+            let constant = builder.ins().iconst(types::I32, index);
+            let cond = builder
+                .ins()
+                .icmp(ir::condcodes::IntCC::Equal, tag, constant);
+            builder.ins().brif(cond, body_block, &[], next_block, &[]);
+            builder.switch_to_block(body_block);
+            builder.seal_block(body_block);
+            let saved = scope.vars.clone();
+            let saved_overrides = self.info.scope_overrides.borrow().clone();
+            for ((binding, payload_ty), offset) in arm
+                .bindings
+                .iter()
+                .zip(payload_types.iter())
+                .zip(offsets.iter())
+            {
+                if let Some(binding) = binding {
+                    let clif_ty = self.type_of(payload_ty)?;
+                    let value = builder.ins().load(
+                        clif_ty,
+                        MemFlags::new(),
+                        pointer,
+                        (data_offset + offset) as i32,
+                    );
+                    let var = builder.declare_var(clif_ty);
+                    builder.def_var(var, value);
+                    self.bind_var(scope, binding.clone(), var, payload_ty.clone());
+                }
+            }
+            self.emit_block(builder, &arm.body, function, scope)?;
+            scope.vars = saved;
+            *self.info.scope_overrides.borrow_mut() = saved_overrides;
+            if !current_block_terminated(builder) {
+                builder.ins().jump(merge_block, &[]);
+            }
+            builder.switch_to_block(next_block);
+            builder.seal_block(next_block);
+        }
+        if !has_wildcard {
+            builder.ins().jump(merge_block, &[]);
+        }
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        Ok(())
+    }
+
+    fn emit_match_scalar(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &Expr,
+        arms: &[crate::ast::MatchArm],
+        is_float: bool,
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<(), CompileError> {
+        let value = self.emit_expr(builder, expr, None, function, scope)?;
+        let value_ty = builder.func.dfg.value_type(value);
+        let merge_block = self.new_block(builder);
+        let mut has_wildcard = false;
+        for arm in arms {
+            let crate::ast::MatchArmKind::Variant(pattern) = &arm.kind else {
+                return Err(CompileError::new(
+                    "scalar matches require literal arms in native code generation",
+                ));
+            };
+            if pattern == "_" {
+                let saved = scope.vars.clone();
+                let saved_overrides = self.info.scope_overrides.borrow().clone();
+                self.emit_block(builder, &arm.body, function, scope)?;
+                scope.vars = saved;
+                *self.info.scope_overrides.borrow_mut() = saved_overrides;
+                if !current_block_terminated(builder) {
+                    builder.ins().jump(merge_block, &[]);
+                }
+                has_wildcard = true;
+                break;
+            }
+            let body_block = self.new_block(builder);
+            let next_block = self.new_block(builder);
+            let cond = if is_float {
+                let text = pattern
+                    .strip_suffix("f32")
+                    .or_else(|| pattern.strip_suffix("f64"))
+                    .unwrap_or(pattern);
+                let number = text.parse::<f64>().map_err(|_| {
+                    CompileError::new(format!(
+                        "invalid floating-point match pattern `{pattern}` in native code generation"
+                    ))
+                })?;
+                let constant = if value_ty == types::F32 {
+                    builder.ins().f32const(number as f32)
+                } else {
+                    builder.ins().f64const(number)
+                };
+                builder
+                    .ins()
+                    .fcmp(ir::condcodes::FloatCC::Equal, value, constant)
+            } else {
+                let number = pattern.parse::<i64>().map_err(|_| {
+                    CompileError::new(format!(
+                        "invalid integer match pattern `{pattern}` in native code generation"
+                    ))
+                })?;
+                let constant = builder.ins().iconst(value_ty, number);
+                builder
+                    .ins()
+                    .icmp(ir::condcodes::IntCC::Equal, value, constant)
+            };
+            builder.ins().brif(cond, body_block, &[], next_block, &[]);
+            builder.switch_to_block(body_block);
+            builder.seal_block(body_block);
+            let saved = scope.vars.clone();
+            let saved_overrides = self.info.scope_overrides.borrow().clone();
+            self.emit_block(builder, &arm.body, function, scope)?;
+            scope.vars = saved;
+            *self.info.scope_overrides.borrow_mut() = saved_overrides;
+            if !current_block_terminated(builder) {
+                builder.ins().jump(merge_block, &[]);
+            }
+            builder.switch_to_block(next_block);
+            builder.seal_block(next_block);
+        }
+        if !has_wildcard {
+            builder.ins().jump(merge_block, &[]);
+        }
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
         Ok(())
     }
 
@@ -763,6 +1523,30 @@ impl<'a> Backend<'a> {
         function: &Function,
         scope: &mut FunctionScope,
     ) -> Result<Value, CompileError> {
+        if let Some(hint_ty) = hint {
+            let resolved_hint = crate::codegen::resolve_codegen_aliases(hint_ty, self.info)?;
+            if let Type::Result(ok_ty) = resolved_hint {
+                let actual = infer_codegen_expr_type(expr, function, self.info)?;
+                let actual = crate::codegen::resolve_codegen_aliases(&actual, self.info)?;
+                return match actual {
+                    Type::Result(_) => self.emit_expr(builder, expr, None, function, scope),
+                    Type::Error => match expr {
+                        Expr::Error { message } => {
+                            let message =
+                                self.emit_expr(builder, message, None, function, scope)?;
+                            self.emit_result_error(builder, &ok_ty, message)
+                        }
+                        _ => Err(CompileError::new(
+                            "missing error constructor payload in native code generation",
+                        )),
+                    },
+                    _ => {
+                        let value = self.emit_expr(builder, expr, Some(&ok_ty), function, scope)?;
+                        self.emit_result_ok(builder, &ok_ty, Some(value))
+                    }
+                };
+            }
+        }
         match expr {
             Expr::Int(value) => {
                 let ty = hint
@@ -868,6 +1652,9 @@ impl<'a> Backend<'a> {
                 self.emit_binary_values(builder, lhs_value, rhs_value, *op, &lhs_ty, &result_ty)
             }
             Expr::Cast { expr, ty } => {
+                if matches!(expr.as_ref(), Expr::ListLiteral(_)) {
+                    return self.emit_expr(builder, expr, Some(ty), function, scope);
+                }
                 let source_ty = infer_codegen_expr_type(expr, function, self.info)?;
                 let value = self.emit_expr(builder, expr, Some(&source_ty), function, scope)?;
                 let target = self.type_of(ty)?;
@@ -885,7 +1672,11 @@ impl<'a> Backend<'a> {
             }
             Expr::Call { callee, args } => self.emit_call(builder, callee, args, function, scope),
             Expr::BuiltinCall { name, args } => {
-                self.emit_builtin(builder, name, args, function, scope)
+                if name == "zeroed" {
+                    self.emit_zeroed(builder, args, hint, function, scope)
+                } else {
+                    self.emit_builtin(builder, name, args, function, scope)
+                }
             }
             Expr::StructInit { name, fields, .. } => {
                 self.emit_struct_init(builder, name, fields, function, scope)
@@ -900,19 +1691,22 @@ impl<'a> Backend<'a> {
                 let clif_ty = self.type_of(&ty)?;
                 Ok(builder.ins().load(clif_ty, MemFlags::new(), address, 0))
             }
-            Expr::MethodCall { .. } => Err(CompileError::new(
-                "native backend does not yet support methods; use -c for the C backend",
-            )),
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+            } => self.emit_list_method(builder, method, receiver, args, function, scope),
             Expr::Specialize { .. } => Err(CompileError::new(
                 "generic specialization must be resolved before native code generation",
             )),
-            Expr::Error { .. } | Expr::Try(_) => Err(CompileError::new(
-                "native backend does not yet support result propagation; use -c for the C backend",
+            Expr::Error { .. } => Err(CompileError::new(
+                "`error(...)` requires a `T|error` context in native code generation",
             )),
+            Expr::Try(inner) => self.emit_try(builder, inner, function, scope),
             Expr::Pack(_) => Err(CompileError::new("packed expression outside of @print")),
-            Expr::ListLiteral(_) => Err(CompileError::new(
-                "native backend does not yet support list literals; use -c for the C backend",
-            )),
+            Expr::ListLiteral(values) => {
+                self.emit_list_literal(builder, values, hint, function, scope)
+            }
         }
     }
 
@@ -933,16 +1727,44 @@ impl<'a> Backend<'a> {
                 let func_ref = self.module.declare_func_in_func(func_id, builder.func);
                 return Ok(builder.ins().func_addr(self.pointer_type, func_ref));
             }
-            if self.info.globals.contains_key(name) {
-                return Err(CompileError::new(
-                    "native backend does not yet support globals",
-                ));
+            if let Some((ty, _)) = self.info.globals.get(name).cloned() {
+                let address = self.global_address(builder, name)?;
+                let clif_ty = self.type_of(&ty)?;
+                return Ok(builder.ins().load(clif_ty, MemFlags::new(), address, 0));
+            }
+        } else if path.len() == 2 {
+            let type_name = &path[0];
+            let variant_name = &path[1];
+            if let Some(type_info) = self.info.types.get(type_name) {
+                if type_info.kind == TypeDefKind::Enum {
+                    if let Some(index) = type_info
+                        .variants
+                        .iter()
+                        .position(|variant| variant.name == *variant_name)
+                    {
+                        return Ok(builder.ins().iconst(types::I32, index as i64));
+                    }
+                }
             }
         }
         Err(CompileError::new(format!(
             "unsupported path `{}` in native code generation",
             path.join(".")
         )))
+    }
+
+    fn global_address(
+        &self,
+        builder: &mut FunctionBuilder,
+        name: &str,
+    ) -> Result<Value, CompileError> {
+        let data_id = self
+            .global_ids
+            .get(name)
+            .copied()
+            .ok_or_else(|| CompileError::new(format!("missing global `{name}`")))?;
+        let gv = self.module.declare_data_in_func(data_id, builder.func);
+        Ok(builder.ins().global_value(self.pointer_type, gv))
     }
 
     fn emit_call(
@@ -954,8 +1776,34 @@ impl<'a> Backend<'a> {
         scope: &mut FunctionScope,
     ) -> Result<Value, CompileError> {
         if let Expr::Path(path) = callee {
+            if path.len() == 2 {
+                let union_name = &path[0];
+                let variant_name = &path[1];
+                if let Some(type_info) = self.info.types.get(union_name) {
+                    if type_info.kind == TypeDefKind::Union
+                        && type_info.variant_map.contains_key(variant_name)
+                    {
+                        return self.emit_union_init(
+                            builder,
+                            union_name,
+                            variant_name,
+                            args,
+                            function,
+                            scope,
+                        );
+                    }
+                }
+            }
             if path.len() == 1 {
-                let fn_ptr_ty = scope.vars.get(&path[0]).map(|(_, ty)| ty.clone());
+                let name = &path[0];
+                if self.info.functions.get(name).is_none()
+                    && self.info.types.get(name).is_some_and(|type_info| {
+                        type_info.kind == TypeDefKind::Struct && type_info.alias.is_none()
+                    })
+                {
+                    return self.emit_struct_init_positional(builder, name, args, function, scope);
+                }
+                let fn_ptr_ty = scope.vars.get(name).map(|(_, ty)| ty.clone());
                 if let Some(Type::FnPtr(param_types, ret)) = fn_ptr_ty {
                     let fn_ptr = self.emit_path(builder, path, function, scope)?;
                     let mut values = Vec::new();
@@ -1077,7 +1925,10 @@ impl<'a> Backend<'a> {
             }
             "addr" => self.emit_addr(builder, &args[0], function, scope),
             "deref" => {
-                let arg_ty = infer_codegen_expr_type(&args[0], function, self.info)?;
+                let arg_ty = crate::codegen::resolve_codegen_aliases(
+                    &infer_codegen_expr_type(&args[0], function, self.info)?,
+                    self.info,
+                )?;
                 let inner = match arg_ty {
                     Type::Ref(inner) | Type::Mut(inner) => *inner,
                     other => {
@@ -1088,18 +1939,26 @@ impl<'a> Backend<'a> {
                     }
                 };
                 let pointer = self.emit_expr(builder, &args[0], None, function, scope)?;
+                if self.deref_is_identity(&inner)? {
+                    return Ok(pointer);
+                }
                 let clif_ty = self.type_of(&inner)?;
                 Ok(builder.ins().load(clif_ty, MemFlags::new(), pointer, 0))
             }
-            "zeroed" => {
+            "args" => {
+                let callee =
+                    self.extern_function("scar_args_list", &[], &Type::Ref(Box::new(Type::Void)))?;
+                let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                let call = builder.ins().call(func_ref, &[]);
+                Ok(self.call_result(builder, call, &Type::Ref(Box::new(Type::Void))))
+            }
+            "len" | "append" | "capacity" | "reserve" | "set" | "insert" | "remove" | "clear" => {
                 if args.is_empty() {
-                    return Err(CompileError::new(
-                        "native backend does not yet support bare @zeroed; use -c for the C backend",
-                    ));
+                    return Err(CompileError::new(format!(
+                        "@{name} expects a list receiver as its first argument"
+                    )));
                 }
-                let ty = infer_codegen_expr_type(&args[0], function, self.info)?;
-                let clif_ty = self.type_of(&ty)?;
-                Ok(builder.ins().iconst(clif_ty, 0))
+                self.emit_list_method(builder, name, &args[0], &args[1..], function, scope)
             }
             "alloc" => {
                 let size =
@@ -1181,14 +2040,33 @@ impl<'a> Backend<'a> {
                 })
             }
             "add" => {
-                let arg_ty = infer_codegen_expr_type(&args[0], function, self.info)?;
+                let arg_ty = crate::codegen::resolve_codegen_aliases(
+                    &infer_codegen_expr_type(&args[0], function, self.info)?,
+                    self.info,
+                )?;
                 let pointer = self.emit_expr(builder, &args[0], None, function, scope)?;
                 let offset = self.emit_expr(builder, &args[1], None, function, scope)?;
-                let scale = match arg_ty {
-                    Type::Ref(inner) | Type::Mut(inner) => self.type_size_align(&inner)?.0.max(1),
-                    Type::Named(name) => self.type_size_align(&Type::Named(name))?.0.max(1),
-                    _ => 1,
+                let (pointer, element_ty) = match &arg_ty {
+                    Type::Ref(inner) | Type::Mut(inner) => match inner.as_ref() {
+                        Type::List(element) => {
+                            let data =
+                                builder
+                                    .ins()
+                                    .load(self.pointer_type, MemFlags::new(), pointer, 0);
+                            (data, (**element).clone())
+                        }
+                        other => (pointer, other.clone()),
+                    },
+                    Type::List(element) => {
+                        let data =
+                            builder
+                                .ins()
+                                .load(self.pointer_type, MemFlags::new(), pointer, 0);
+                        (data, (**element).clone())
+                    }
+                    other => (pointer, other.clone()),
                 };
+                let scale = self.value_size_align(&element_ty)?.0.max(1);
                 let scale = builder.ins().iconst(types::I64, scale as i64);
                 let offset = self.coerce_value(builder, offset, types::I64, &Type::I64)?;
                 let offset = builder.ins().imul(offset, scale);
@@ -1213,7 +2091,7 @@ impl<'a> Backend<'a> {
                 Ok(self.call_result(builder, call, &ret))
             }
             other => Err(CompileError::new(format!(
-                "native backend does not yet support builtin @{other}; use -c for the C backend"
+                "unsupported builtin intrinsic `@{other}` in native code generation"
             ))),
         }
     }
@@ -1453,17 +2331,11 @@ impl<'a> Backend<'a> {
         if let Expr::Path(path) = expr {
             if path.len() == 1 {
                 if let Some((var, ty)) = scope.vars.get(&path[0]).cloned() {
-                    let value = builder.use_var(var);
-                    if matches!(
-                        ty,
-                        Type::Named(_)
-                            | Type::Applied(_, _)
-                            | Type::List(_)
-                            | Type::FixedArray(_, _)
-                    ) {
-                        return Ok(value);
+                    if self.addr_is_value(&ty)? {
+                        return Ok(builder.use_var(var));
                     }
-                    let size = self.type_size_align(&ty)?.0.max(1);
+                    let value = builder.use_var(var);
+                    let size = self.value_size_align(&ty)?.0.max(1);
                     let slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         size as u32,
@@ -1472,7 +2344,17 @@ impl<'a> Backend<'a> {
                     builder.ins().stack_store(value, slot, 0);
                     return Ok(builder.ins().stack_addr(self.pointer_type, slot, 0));
                 }
+                if let Some((ty, _)) = self.info.globals.get(&path[0]).cloned() {
+                    if self.addr_is_value(&ty)? {
+                        return self.emit_expr(builder, expr, Some(&ty), function, scope);
+                    }
+                    return self.global_address(builder, &path[0]);
+                }
             }
+        }
+        let ty = infer_codegen_expr_type(expr, function, self.info)?;
+        if self.addr_is_value(&ty)? {
+            return self.emit_expr(builder, expr, Some(&ty), function, scope);
         }
         let deref_expr = matches!(
             expr,
@@ -1482,9 +2364,8 @@ impl<'a> Backend<'a> {
             let (address, _) = self.lvalue(builder, expr, function, scope)?;
             return Ok(address);
         }
-        Err(CompileError::new(
-            "@addr requires an addressable expression in native code generation",
-        ))
+        let value = self.emit_expr(builder, expr, Some(&ty), function, scope)?;
+        Ok(self.emit_value_pointer(builder, value, &ty)?)
     }
 
     fn emit_logical(
@@ -1541,8 +2422,8 @@ impl<'a> Backend<'a> {
         let lhs_clif = builder.func.dfg.value_type(lhs);
         let rhs_clif = builder.func.dfg.value_type(rhs);
         let arithmetic_ty = common_numeric_clif(lhs_clif, rhs_clif).unwrap_or(lhs_clif);
-        let lhs = self.coerce_raw(builder, lhs, arithmetic_ty);
-        let rhs = self.coerce_raw(builder, rhs, arithmetic_ty);
+        let lhs = self.coerce_value(builder, lhs, arithmetic_ty, lhs_ty)?;
+        let rhs = self.coerce_value(builder, rhs, arithmetic_ty, lhs_ty)?;
         let bits = arithmetic_ty.bits();
         let is_signed = is_codegen_signed_integer_type(lhs_ty);
         let is_float = arithmetic_ty.is_float();
@@ -1571,15 +2452,20 @@ impl<'a> Backend<'a> {
             }),
             BinaryOp::Modulo => {
                 if is_float {
-                    return Err(CompileError::new(
-                        "native backend does not yet support floating-point modulo",
-                    ));
-                }
-                Ok(if is_signed {
-                    builder.ins().srem(lhs, rhs)
+                    let (name, ty) = if arithmetic_ty == types::F32 {
+                        ("fmodf", Type::F32)
+                    } else {
+                        ("fmod", Type::F64)
+                    };
+                    let callee = self.extern_function(name, &[ty.clone(), ty.clone()], &ty)?;
+                    let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                    let call = builder.ins().call(func_ref, &[lhs, rhs]);
+                    Ok(builder.inst_results(call)[0])
+                } else if is_signed {
+                    Ok(builder.ins().srem(lhs, rhs))
                 } else {
-                    builder.ins().urem(lhs, rhs)
-                })
+                    Ok(builder.ins().urem(lhs, rhs))
+                }
             }
             BinaryOp::BitAnd => Ok(builder.ins().band(lhs, rhs)),
             BinaryOp::BitOr => Ok(builder.ins().bor(lhs, rhs)),
@@ -1774,6 +2660,11 @@ impl<'a> Backend<'a> {
                     builder.def_var(var, value);
                     return Ok(());
                 }
+                if self.info.globals.contains_key(&path[0]) {
+                    let address = self.global_address(builder, &path[0])?;
+                    builder.ins().store(MemFlags::new(), value, address, 0);
+                    return Ok(());
+                }
             }
         }
         let (addr, _) = self.lvalue(builder, target, function, scope)?;
@@ -1791,67 +2682,112 @@ impl<'a> Backend<'a> {
         match expr {
             Expr::Path(path) if path.len() == 1 => {
                 let name = &path[0];
-                let (var, ty) = scope
-                    .vars
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| CompileError::new(format!("unknown local `{name}`")))?;
-                let value = builder.use_var(var);
-                if is_pointer_value_type(&ty) {
-                    return Ok((value, ty));
+                if let Some((var, ty)) = scope.vars.get(name).cloned() {
+                    let value = builder.use_var(var);
+                    if self.value_is_pointer(&ty)? {
+                        return Ok((value, ty));
+                    }
+                    let slot_key = name.clone();
+                    let size = self.value_size_align(&ty)?.0.max(1);
+                    let slot = if let Some(slot) = scope.temp_slots.get(&slot_key) {
+                        *slot
+                    } else {
+                        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            size as u32,
+                            3,
+                        ));
+                        scope.temp_slots.insert(slot_key, slot);
+                        slot
+                    };
+                    builder.ins().stack_store(value, slot, 0);
+                    return Ok((builder.ins().stack_addr(self.pointer_type, slot, 0), ty));
                 }
-                let slot_key = name.clone();
-                let size = self.type_size_align(&ty)?.0.max(1);
-                let slot = if let Some(slot) = scope.temp_slots.get(&slot_key) {
-                    *slot
+                let ty = self
+                    .info
+                    .globals
+                    .get(name)
+                    .map(|(ty, _)| ty.clone())
+                    .ok_or_else(|| CompileError::new(format!("unknown local `{name}`")))?;
+                let address = self.global_address(builder, name)?;
+                if self.value_is_pointer(&ty)? {
+                    let clif_ty = self.type_of(&ty)?;
+                    let value = builder.ins().load(clif_ty, MemFlags::new(), address, 0);
+                    Ok((value, ty))
                 } else {
-                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        size as u32,
-                        3,
-                    ));
-                    scope.temp_slots.insert(slot_key, slot);
-                    slot
-                };
-                builder.ins().stack_store(value, slot, 0);
-                Ok((builder.ins().stack_addr(self.pointer_type, slot, 0), ty))
+                    Ok((address, ty))
+                }
             }
             Expr::FieldAccess { base, field } => {
-                let base_ty = infer_codegen_expr_type(base, function, self.info)?;
-                let (address, _) = self.lvalue(builder, base, function, scope)?;
+                let base_ty = crate::codegen::resolve_codegen_aliases(
+                    &infer_codegen_expr_type(base, function, self.info)?,
+                    self.info,
+                )?;
+                let address = if matches!(
+                    crate::codegen::deref_refs(&base_ty),
+                    Type::Named(_) | Type::Applied(_, _)
+                ) {
+                    self.emit_expr(builder, base, Some(&base_ty), function, scope)?
+                } else {
+                    self.lvalue(builder, base, function, scope)?.0
+                };
                 let ty = self.field_type(&base_ty, field)?;
                 let offset = self.field_offset(&base_ty, field)?;
                 Ok((builder.ins().iadd_imm(address, offset as i64), ty))
             }
             Expr::Index { base, index } => {
-                let base_ty = infer_codegen_expr_type(base, function, self.info)?;
-                let element_ty = match &base_ty {
-                    Type::FixedArray(_, inner) => (**inner).clone(),
-                    Type::List(inner) => (**inner).clone(),
-                    Type::Ref(inner) | Type::Mut(inner) => match inner.as_ref() {
-                        Type::FixedArray(_, element) => (**element).clone(),
-                        other => {
-                            return Err(CompileError::new(format!(
-                                "cannot index {} in native backend",
-                                describe_type(other)
-                            )));
-                        }
-                    },
+                let base_ty = crate::codegen::resolve_codegen_aliases(
+                    &infer_codegen_expr_type(base, function, self.info)?,
+                    self.info,
+                )?;
+                let (element_ty, address) = match crate::codegen::deref_refs(&base_ty) {
+                    Type::List(inner) => {
+                        let element_ty = (**inner).clone();
+                        let header =
+                            self.emit_expr(builder, base, Some(&base_ty), function, scope)?;
+                        let index_value = self.emit_expr(builder, index, None, function, scope)?;
+                        let index_value =
+                            self.coerce_value(builder, index_value, types::I32, &Type::I32)?;
+                        let element_size = self.value_size_align(&element_ty)?.0.max(1);
+                        let element_size =
+                            builder.ins().iconst(self.pointer_type, element_size as i64);
+                        let callee = self.extern_function(
+                            "scar_list_at",
+                            &[Type::Ref(Box::new(Type::Void)), Type::I32, Type::Usize],
+                            &Type::Ref(Box::new(Type::Void)),
+                        )?;
+                        let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                        let call = builder
+                            .ins()
+                            .call(func_ref, &[header, index_value, element_size]);
+                        let address = builder.inst_results(call)[0];
+                        (element_ty, address)
+                    }
+                    Type::FixedArray(_, inner) => {
+                        let element_ty = (**inner).clone();
+                        let data =
+                            self.emit_expr(builder, base, Some(&base_ty), function, scope)?;
+                        let index_value = self.emit_expr(builder, index, None, function, scope)?;
+                        let index_value = self.coerce_value(
+                            builder,
+                            index_value,
+                            self.pointer_type,
+                            &Type::Usize,
+                        )?;
+                        let element_size = self.value_size_align(&element_ty)?.0.max(1);
+                        let element_size =
+                            builder.ins().iconst(self.pointer_type, element_size as i64);
+                        let offset = builder.ins().imul(index_value, element_size);
+                        (element_ty, builder.ins().iadd(data, offset))
+                    }
                     other => {
                         return Err(CompileError::new(format!(
                             "cannot index {} in native backend",
-                            describe_type(other)
+                            describe_type(&other)
                         )));
                     }
                 };
-                let (address, _) = self.lvalue(builder, base, function, scope)?;
-                let index_value = self.emit_expr(builder, index, None, function, scope)?;
-                let index_value =
-                    self.coerce_value(builder, index_value, types::I64, &Type::I64)?;
-                let element_size = self.type_size_align(&element_ty)?.0.max(1);
-                let element_size = builder.ins().iconst(types::I64, element_size as i64);
-                let offset = builder.ins().imul(index_value, element_size);
-                Ok((builder.ins().iadd(address, offset), element_ty))
+                Ok((address, element_ty))
             }
             Expr::BuiltinCall { name, args } if name == "deref" => {
                 let ty = infer_codegen_expr_type(expr, function, self.info)?;
@@ -1879,7 +2815,7 @@ impl<'a> Backend<'a> {
             .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
         if type_info.kind != TypeDefKind::Struct {
             return Err(CompileError::new(format!(
-                "native backend does not yet support initializing type `{name}`"
+                "type `{name}` cannot be initialized with struct syntax in native code generation"
             )));
         }
         let (size, _) = self.type_size_align(&Type::Named(name.to_string()))?;
@@ -1915,6 +2851,618 @@ impl<'a> Backend<'a> {
         Ok(pointer)
     }
 
+    fn emit_struct_init_positional(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        name: &str,
+        args: &[Expr],
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<Value, CompileError> {
+        let type_info = self
+            .info
+            .types
+            .get(name)
+            .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
+        if type_info.fields.len() != args.len() {
+            return Err(CompileError::new(format!(
+                "type `{name}` expects {} constructor arguments but received {}",
+                type_info.fields.len(),
+                args.len()
+            )));
+        }
+        let fields: Vec<crate::ast::FieldInit> = type_info
+            .fields
+            .iter()
+            .zip(args.iter())
+            .map(|(field, value)| crate::ast::FieldInit {
+                name: field.name.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        self.emit_struct_init(builder, name, &fields, function, scope)
+    }
+
+    fn emit_union_init(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        union_name: &str,
+        variant_name: &str,
+        args: &[Expr],
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<Value, CompileError> {
+        let type_info = self
+            .info
+            .types
+            .get(union_name)
+            .ok_or_else(|| CompileError::new(format!("unknown type `{union_name}`")))?;
+        let payload_types = type_info
+            .variant_map
+            .get(variant_name)
+            .cloned()
+            .ok_or_else(|| {
+                CompileError::new(format!(
+                    "union `{union_name}` has no variant `{variant_name}`"
+                ))
+            })?;
+        let (size, _) = self.type_size_align(&Type::Named(union_name.to_string()))?;
+        let pointer = self.emit_calloc(builder, size.max(1))?;
+        let variant_index = type_info
+            .variants
+            .iter()
+            .position(|variant| variant.name == variant_name)
+            .unwrap_or(0);
+        let tag = builder.ins().iconst(types::I32, variant_index as i64);
+        builder.ins().store(MemFlags::new(), tag, pointer, 0);
+        let data_offset = self.union_data_offset(union_name)?;
+        let (_, _, offsets) = self.variant_payload_layout(union_name, variant_name)?;
+        for (((arg, payload_ty), offset), _) in args
+            .iter()
+            .zip(payload_types.iter())
+            .zip(offsets.iter())
+            .zip(0usize..)
+        {
+            let value = self.emit_expr(builder, arg, Some(payload_ty), function, scope)?;
+            let clif_ty = self.type_of(payload_ty)?;
+            let value = self.coerce_value(builder, value, clif_ty, payload_ty)?;
+            builder.ins().store(
+                MemFlags::new(),
+                value,
+                pointer,
+                (data_offset + offset) as i32,
+            );
+        }
+        Ok(pointer)
+    }
+
+    fn emit_calloc(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        size: u64,
+    ) -> Result<Value, CompileError> {
+        let count = builder.ins().iconst(self.pointer_type, 1);
+        let size = builder.ins().iconst(self.pointer_type, size.max(1) as i64);
+        let callee = self.extern_function(
+            "calloc",
+            &[Type::Usize, Type::Usize],
+            &Type::Ref(Box::new(Type::Void)),
+        )?;
+        let func_ref = self.module.declare_func_in_func(callee, builder.func);
+        let call = builder.ins().call(func_ref, &[count, size]);
+        Ok(builder.inst_results(call)[0])
+    }
+
+    fn emit_value_pointer(
+        &self,
+        builder: &mut FunctionBuilder,
+        value: Value,
+        ty: &Type,
+    ) -> Result<Value, CompileError> {
+        let size = self.value_size_align(ty)?.0.max(1);
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            size as u32,
+            3,
+        ));
+        builder.ins().stack_store(value, slot, 0);
+        Ok(builder.ins().stack_addr(self.pointer_type, slot, 0))
+    }
+
+    fn emit_zeroed(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        args: &[Expr],
+        hint: Option<&Type>,
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<Value, CompileError> {
+        let ty = if let Some(arg) = args.first() {
+            infer_codegen_expr_type(arg, function, self.info)?
+        } else if let Some(hint) = hint {
+            crate::codegen::resolve_codegen_aliases(hint, self.info)?
+        } else {
+            return Err(CompileError::new(
+                "cannot infer the type of a bare @zeroed() in native code generation",
+            ));
+        };
+        self.emit_zeroed_value(builder, &ty, function, scope)
+    }
+
+    fn emit_zeroed_value(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ty: &Type,
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<Value, CompileError> {
+        let ty = crate::codegen::resolve_codegen_aliases(ty, self.info)?;
+        match ty {
+            Type::Void | Type::Infer => Ok(builder.ins().iconst(types::I32, 0)),
+            Type::Bool | Type::I8 | Type::U8 => Ok(builder.ins().iconst(types::I8, 0)),
+            Type::I16 | Type::U16 => Ok(builder.ins().iconst(types::I16, 0)),
+            Type::I32 | Type::U32 => Ok(builder.ins().iconst(types::I32, 0)),
+            Type::I64 | Type::U64 | Type::Isize | Type::Usize => {
+                Ok(builder.ins().iconst(self.pointer_type, 0))
+            }
+            Type::F32 => Ok(builder.ins().f32const(0.0)),
+            Type::F64 => Ok(builder.ins().f64const(0.0)),
+            Type::Ref(_) | Type::Mut(_) | Type::FnPtr(_, _) | Type::None | Type::Error => {
+                Ok(builder.ins().iconst(self.pointer_type, 0))
+            }
+            Type::List(_) => self.emit_list_new(builder),
+            Type::Result(ok_ty) => {
+                let ok_value = if ok_ty.as_ref() == &Type::Void {
+                    None
+                } else {
+                    Some(self.emit_zeroed_value(builder, &ok_ty, function, scope)?)
+                };
+                self.emit_result_ok(builder, &ok_ty, ok_value)
+            }
+            Type::FixedArray(count, inner) => {
+                let (stride, _) = self.value_size_align(&inner)?;
+                let stride = stride.max(1);
+                let pointer = self.emit_calloc(builder, stride * count)?;
+                if self.value_is_pointer(&inner)? {
+                    for index in 0..count {
+                        let value = self.emit_zeroed_value(builder, &inner, function, scope)?;
+                        let clif_ty = self.type_of(&inner)?;
+                        let value = self.coerce_value(builder, value, clif_ty, &inner)?;
+                        builder.ins().store(
+                            MemFlags::new(),
+                            value,
+                            pointer,
+                            (stride * index) as i32,
+                        );
+                    }
+                }
+                Ok(pointer)
+            }
+            Type::Applied(name, _) => {
+                self.emit_zeroed_value(builder, &Type::Named(name), function, scope)
+            }
+            Type::Named(name) => {
+                let type_info = self
+                    .info
+                    .types
+                    .get(&name)
+                    .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
+                match type_info.kind {
+                    TypeDefKind::Enum => Ok(builder.ins().iconst(types::I32, 0)),
+                    TypeDefKind::Struct => {
+                        let (size, _) = self.type_size_align(&Type::Named(name.clone()))?;
+                        let pointer = self.emit_calloc(builder, size.max(1))?;
+                        for field in &type_info.fields {
+                            if self.value_is_pointer(&field.ty)? {
+                                let value =
+                                    self.emit_zeroed_value(builder, &field.ty, function, scope)?;
+                                let clif_ty = self.type_of(&field.ty)?;
+                                let value =
+                                    self.coerce_value(builder, value, clif_ty, &field.ty)?;
+                                let offset =
+                                    self.field_offset(&Type::Named(name.clone()), &field.name)?;
+                                builder
+                                    .ins()
+                                    .store(MemFlags::new(), value, pointer, offset as i32);
+                            }
+                        }
+                        Ok(pointer)
+                    }
+                    TypeDefKind::Union => {
+                        let (size, _) = self.type_size_align(&Type::Named(name.clone()))?;
+                        let pointer = self.emit_calloc(builder, size.max(1))?;
+                        if let Some(variant) = type_info.variants.first() {
+                            let data_offset = self.union_data_offset(&name)?;
+                            let (_, _, offsets) =
+                                self.variant_payload_layout(&name, &variant.name)?;
+                            for (payload_ty, offset) in
+                                variant.payload_types.iter().zip(offsets.iter())
+                            {
+                                if self.value_is_pointer(payload_ty)? {
+                                    let value = self
+                                        .emit_zeroed_value(builder, payload_ty, function, scope)?;
+                                    let clif_ty = self.type_of(payload_ty)?;
+                                    let value =
+                                        self.coerce_value(builder, value, clif_ty, payload_ty)?;
+                                    builder.ins().store(
+                                        MemFlags::new(),
+                                        value,
+                                        pointer,
+                                        (data_offset + offset) as i32,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(pointer)
+                    }
+                }
+            }
+        }
+    }
+
+    fn emit_list_new(&mut self, builder: &mut FunctionBuilder) -> Result<Value, CompileError> {
+        let callee =
+            self.extern_function("scar_list_new", &[], &Type::Ref(Box::new(Type::Void)))?;
+        let func_ref = self.module.declare_func_in_func(callee, builder.func);
+        let call = builder.ins().call(func_ref, &[]);
+        Ok(builder.inst_results(call)[0])
+    }
+
+    fn emit_list_literal(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        values: &[Expr],
+        hint: Option<&Type>,
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<Value, CompileError> {
+        let resolved_hint = hint
+            .map(|ty| crate::codegen::resolve_codegen_aliases(ty, self.info))
+            .transpose()?;
+        if let Some(Type::FixedArray(count, element_ty)) = resolved_hint.as_ref() {
+            let (stride, _) = self.value_size_align(element_ty)?;
+            let stride = stride.max(1);
+            let pointer = self.emit_calloc(builder, stride * *count)?;
+            if values.len() as u64 > *count {
+                return Err(CompileError::new(format!(
+                    "fixed array initializer has {} values but the array holds {}",
+                    values.len(),
+                    count
+                )));
+            }
+            for (index, value_expr) in values.iter().enumerate() {
+                let value =
+                    self.emit_expr(builder, value_expr, Some(element_ty), function, scope)?;
+                let clif_ty = self.type_of(element_ty)?;
+                let value = self.coerce_value(builder, value, clif_ty, element_ty)?;
+                builder.ins().store(
+                    MemFlags::new(),
+                    value,
+                    pointer,
+                    (stride * index as u64) as i32,
+                );
+            }
+            return Ok(pointer);
+        }
+
+        let element_ty = if let Some(Type::List(element)) = resolved_hint.as_ref() {
+            (**element).clone()
+        } else {
+            let inferred =
+                infer_codegen_expr_type(&Expr::ListLiteral(values.to_vec()), function, self.info)?;
+            let Type::List(element) = inferred else {
+                return Err(CompileError::new(
+                    "list literal requires a list type hint in native code generation",
+                ));
+            };
+            (*element).clone()
+        };
+        let list = self.emit_list_new(builder)?;
+        let (element_size, _) = self.value_size_align(&element_ty)?;
+        let element_size = element_size.max(1);
+        for value_expr in values {
+            let value = self.emit_expr(builder, value_expr, Some(&element_ty), function, scope)?;
+            let clif_ty = self.type_of(&element_ty)?;
+            let value = self.coerce_value(builder, value, clif_ty, &element_ty)?;
+            let value_ptr = self.emit_value_pointer(builder, value, &element_ty)?;
+            let size_value = builder.ins().iconst(self.pointer_type, element_size as i64);
+            let callee = self.extern_function(
+                "scar_list_append",
+                &[
+                    Type::Ref(Box::new(Type::Void)),
+                    Type::Ref(Box::new(Type::Void)),
+                    Type::Usize,
+                ],
+                &Type::Void,
+            )?;
+            let func_ref = self.module.declare_func_in_func(callee, builder.func);
+            let _ = builder.ins().call(func_ref, &[list, value_ptr, size_value]);
+        }
+        Ok(list)
+    }
+
+    fn emit_list_method(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        method: &str,
+        receiver: &Expr,
+        args: &[Expr],
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<Value, CompileError> {
+        let receiver_ty = crate::codegen::resolve_codegen_aliases(
+            &infer_codegen_expr_type(receiver, function, self.info)?,
+            self.info,
+        )?;
+        let element_ty = match crate::codegen::deref_refs(&receiver_ty) {
+            Type::List(element) => (**element).clone(),
+            other => {
+                return Err(CompileError::new(format!(
+                    "`{method}` requires a list receiver in native code generation, got {}",
+                    describe_type(other)
+                )));
+            }
+        };
+        let header = self.emit_expr(builder, receiver, Some(&receiver_ty), function, scope)?;
+        let (element_size, _) = self.value_size_align(&element_ty)?;
+        let element_size = element_size.max(1);
+        match method {
+            "append" => {
+                let value =
+                    self.emit_expr(builder, &args[0], Some(&element_ty), function, scope)?;
+                let clif_ty = self.type_of(&element_ty)?;
+                let value = self.coerce_value(builder, value, clif_ty, &element_ty)?;
+                let value_ptr = self.emit_value_pointer(builder, value, &element_ty)?;
+                let size_value = builder.ins().iconst(self.pointer_type, element_size as i64);
+                let callee = self.extern_function(
+                    "scar_list_append",
+                    &[
+                        Type::Ref(Box::new(Type::Void)),
+                        Type::Ref(Box::new(Type::Void)),
+                        Type::Usize,
+                    ],
+                    &Type::Void,
+                )?;
+                let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                let _ = builder
+                    .ins()
+                    .call(func_ref, &[header, value_ptr, size_value]);
+                Ok(builder.ins().iconst(types::I32, 0))
+            }
+            "capacity" => {
+                let callee = self.extern_function(
+                    "scar_list_capacity",
+                    &[Type::Ref(Box::new(Type::Void))],
+                    &Type::I32,
+                )?;
+                let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                let call = builder.ins().call(func_ref, &[header]);
+                Ok(self.call_result(builder, call, &Type::I32))
+            }
+            "len" => {
+                let callee = self.extern_function(
+                    "scar_list_len",
+                    &[Type::Ref(Box::new(Type::Void))],
+                    &Type::I32,
+                )?;
+                let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                let call = builder.ins().call(func_ref, &[header]);
+                let length = builder.inst_results(call)[0];
+                self.coerce_value(builder, length, self.pointer_type, &Type::Usize)
+            }
+            "reserve" => {
+                let capacity =
+                    self.emit_expr(builder, &args[0], Some(&Type::I32), function, scope)?;
+                let capacity = self.coerce_value(builder, capacity, types::I32, &Type::I32)?;
+                let size_value = builder.ins().iconst(self.pointer_type, element_size as i64);
+                let callee = self.extern_function(
+                    "scar_list_reserve",
+                    &[Type::Ref(Box::new(Type::Void)), Type::I32, Type::Usize],
+                    &Type::Void,
+                )?;
+                let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                let _ = builder
+                    .ins()
+                    .call(func_ref, &[header, capacity, size_value]);
+                Ok(builder.ins().iconst(types::I32, 0))
+            }
+            "set" | "insert" => {
+                let index = self.emit_expr(builder, &args[0], Some(&Type::I32), function, scope)?;
+                let index = self.coerce_value(builder, index, types::I32, &Type::I32)?;
+                let value =
+                    self.emit_expr(builder, &args[1], Some(&element_ty), function, scope)?;
+                let clif_ty = self.type_of(&element_ty)?;
+                let value = self.coerce_value(builder, value, clif_ty, &element_ty)?;
+                let value_ptr = self.emit_value_pointer(builder, value, &element_ty)?;
+                let size_value = builder.ins().iconst(self.pointer_type, element_size as i64);
+                let name = if method == "set" {
+                    "scar_list_set"
+                } else {
+                    "scar_list_insert"
+                };
+                let callee = self.extern_function(
+                    name,
+                    &[
+                        Type::Ref(Box::new(Type::Void)),
+                        Type::I32,
+                        Type::Ref(Box::new(Type::Void)),
+                        Type::Usize,
+                    ],
+                    &Type::Void,
+                )?;
+                let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                let _ = builder
+                    .ins()
+                    .call(func_ref, &[header, index, value_ptr, size_value]);
+                Ok(builder.ins().iconst(types::I32, 0))
+            }
+            "remove" => {
+                let index = self.emit_expr(builder, &args[0], Some(&Type::I32), function, scope)?;
+                let index = self.coerce_value(builder, index, types::I32, &Type::I32)?;
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    element_size as u32,
+                    3,
+                ));
+                let out_ptr = builder.ins().stack_addr(self.pointer_type, slot, 0);
+                let size_value = builder.ins().iconst(self.pointer_type, element_size as i64);
+                let callee = self.extern_function(
+                    "scar_list_remove",
+                    &[
+                        Type::Ref(Box::new(Type::Void)),
+                        Type::I32,
+                        Type::Ref(Box::new(Type::Void)),
+                        Type::Usize,
+                    ],
+                    &Type::Void,
+                )?;
+                let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                let _ = builder
+                    .ins()
+                    .call(func_ref, &[header, index, out_ptr, size_value]);
+                let clif_ty = self.type_of(&element_ty)?;
+                Ok(builder.ins().load(clif_ty, MemFlags::new(), out_ptr, 0))
+            }
+            "clear" => {
+                let callee = self.extern_function(
+                    "scar_list_clear",
+                    &[Type::Ref(Box::new(Type::Void))],
+                    &Type::Void,
+                )?;
+                let func_ref = self.module.declare_func_in_func(callee, builder.func);
+                let _ = builder.ins().call(func_ref, &[header]);
+                Ok(builder.ins().iconst(types::I32, 0))
+            }
+            other => Err(CompileError::new(format!(
+                "unsupported list accessor `{other}` in native code generation"
+            ))),
+        }
+    }
+
+    fn result_layout(&self, ok_ty: &Type) -> Result<ResultLayout, CompileError> {
+        let ok_ty = crate::codegen::resolve_codegen_aliases(ok_ty, self.info)?;
+        let (ok_size, ok_align) = if ok_ty == Type::Void {
+            (0, 1)
+        } else {
+            self.value_size_align(&ok_ty)?
+        };
+        let ok_offset = align_to(4, ok_align.max(1));
+        let pointer_align = (self.pointer_type.bits() / 8) as u64;
+        let error_offset = align_to(ok_offset + ok_size, pointer_align);
+        let size = align_to(error_offset + pointer_align, pointer_align.max(4));
+        Ok(ResultLayout {
+            ok_offset,
+            error_offset,
+            size,
+        })
+    }
+
+    fn emit_result_ok(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ok_ty: &Type,
+        ok_value: Option<Value>,
+    ) -> Result<Value, CompileError> {
+        let layout = self.result_layout(ok_ty)?;
+        let pointer = self.emit_calloc(builder, layout.size)?;
+        if let Some(value) = ok_value {
+            let clif_ty = self.type_of(ok_ty)?;
+            let value = self.coerce_value(builder, value, clif_ty, ok_ty)?;
+            builder
+                .ins()
+                .store(MemFlags::new(), value, pointer, layout.ok_offset as i32);
+        }
+        Ok(pointer)
+    }
+
+    fn emit_result_error(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ok_ty: &Type,
+        message: Value,
+    ) -> Result<Value, CompileError> {
+        let layout = self.result_layout(ok_ty)?;
+        let pointer = self.emit_calloc(builder, layout.size)?;
+        let one = builder.ins().iconst(types::I32, 1);
+        builder.ins().store(MemFlags::new(), one, pointer, 0);
+        builder.ins().store(
+            MemFlags::new(),
+            message,
+            pointer,
+            layout.error_offset as i32,
+        );
+        Ok(pointer)
+    }
+
+    fn emit_try(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        inner: &Expr,
+        function: &Function,
+        scope: &mut FunctionScope,
+    ) -> Result<Value, CompileError> {
+        let result_ty = crate::codegen::resolve_codegen_aliases(
+            &infer_codegen_expr_type(inner, function, self.info)?,
+            self.info,
+        )?;
+        let Type::Result(ok_ty) = result_ty else {
+            return Err(CompileError::new(
+                "`?` requires a result value in native code generation",
+            ));
+        };
+        let layout = self.result_layout(&ok_ty)?;
+        let pointer = self.emit_expr(builder, inner, None, function, scope)?;
+        let is_error = builder.ins().load(types::I32, MemFlags::new(), pointer, 0);
+        let error_block = self.new_block(builder);
+        let ok_block = self.new_block(builder);
+        builder
+            .ins()
+            .brif(is_error, error_block, &[], ok_block, &[]);
+        builder.switch_to_block(error_block);
+        builder.seal_block(error_block);
+        let message = builder.ins().load(
+            self.pointer_type,
+            MemFlags::new(),
+            pointer,
+            layout.error_offset as i32,
+        );
+        if function.name == "main" || function.name.starts_with("__scar_test_case_") {
+            let panic = self.extern_function(
+                "scar_runtime_panic",
+                &[Type::Ref(Box::new(Type::U8))],
+                &Type::Void,
+            )?;
+            let panic_ref = self.module.declare_func_in_func(panic, builder.func);
+            let _ = builder.ins().call(panic_ref, &[message]);
+            builder.ins().trap(ir::TrapCode::user(1).unwrap());
+        } else {
+            let resolved_return =
+                crate::codegen::resolve_codegen_aliases(&function.return_type, self.info)?;
+            let Type::Result(function_ok_ty) = resolved_return else {
+                return Err(CompileError::new(
+                    "`?` propagation requires a result-returning function in native code generation",
+                ));
+            };
+            let error_value = self.emit_result_error(builder, &function_ok_ty, message)?;
+            self.emit_all_defers(builder, function, scope)?;
+            if !current_block_terminated(builder) {
+                builder
+                    .ins()
+                    .jump(scope.return_block, &[error_value.into()]);
+            }
+        }
+        builder.switch_to_block(ok_block);
+        builder.seal_block(ok_block);
+        if ok_ty.as_ref() == &Type::Void {
+            Ok(builder.ins().iconst(types::I32, 0))
+        } else {
+            let clif_ty = self.type_of(&ok_ty)?;
+            Ok(builder
+                .ins()
+                .load(clif_ty, MemFlags::new(), pointer, layout.ok_offset as i32))
+        }
+    }
+
     fn type_of(&self, ty: &Type) -> Result<ClifType, CompileError> {
         let ty = crate::codegen::resolve_codegen_aliases(ty, self.info)?;
         Ok(match ty {
@@ -1932,25 +3480,138 @@ impl<'a> Backend<'a> {
                     .types
                     .get(&name)
                     .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
-                if type_info.kind != TypeDefKind::Struct {
-                    return Err(CompileError::new(format!(
-                        "native backend does not yet support type `{name}`"
-                    )));
+                if type_info.kind == TypeDefKind::Enum {
+                    types::I32
+                } else {
+                    self.pointer_type
                 }
-                self.pointer_type
             }
-            Type::Ref(_) | Type::Mut(_) | Type::None | Type::FnPtr(_, _) => self.pointer_type,
-            Type::Applied(_, _)
+            Type::Applied(name, _) => {
+                let type_info = self
+                    .info
+                    .types
+                    .get(&name)
+                    .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
+                if type_info.kind == TypeDefKind::Enum {
+                    types::I32
+                } else {
+                    self.pointer_type
+                }
+            }
+            Type::Ref(_)
+            | Type::Mut(_)
+            | Type::None
+            | Type::FnPtr(_, _)
             | Type::List(_)
             | Type::FixedArray(_, _)
             | Type::Result(_)
-            | Type::Error => {
-                return Err(CompileError::new(format!(
-                    "native backend does not yet support {} values",
-                    describe_type(&ty)
-                )));
-            }
+            | Type::Error => self.pointer_type,
             Type::Infer => types::I32,
+        })
+    }
+
+    fn value_is_pointer(&self, ty: &Type) -> Result<bool, CompileError> {
+        let ty = crate::codegen::resolve_codegen_aliases(ty, self.info)?;
+        Ok(match ty {
+            Type::Named(name) => self
+                .info
+                .types
+                .get(&name)
+                .map(|type_info| type_info.kind != TypeDefKind::Enum)
+                .unwrap_or(false),
+            Type::Applied(name, _) => self
+                .info
+                .types
+                .get(&name)
+                .map(|type_info| type_info.kind != TypeDefKind::Enum)
+                .unwrap_or(false),
+            Type::Ref(_)
+            | Type::Mut(_)
+            | Type::None
+            | Type::FnPtr(_, _)
+            | Type::List(_)
+            | Type::FixedArray(_, _)
+            | Type::Result(_)
+            | Type::Error => true,
+            _ => false,
+        })
+    }
+
+    fn addr_is_value(&self, ty: &Type) -> Result<bool, CompileError> {
+        let ty = crate::codegen::resolve_codegen_aliases(ty, self.info)?;
+        Ok(match ty {
+            Type::Named(name) => self
+                .info
+                .types
+                .get(&name)
+                .map(|type_info| type_info.kind != TypeDefKind::Enum)
+                .unwrap_or(false),
+            Type::Applied(name, _) => self
+                .info
+                .types
+                .get(&name)
+                .map(|type_info| type_info.kind != TypeDefKind::Enum)
+                .unwrap_or(false),
+            Type::List(_) | Type::FixedArray(_, _) | Type::Result(_) => true,
+            _ => false,
+        })
+    }
+
+    fn deref_is_identity(&self, ty: &Type) -> Result<bool, CompileError> {
+        let ty = crate::codegen::resolve_codegen_aliases(ty, self.info)?;
+        Ok(match ty {
+            Type::Named(name) => self
+                .info
+                .types
+                .get(&name)
+                .map(|type_info| type_info.kind != TypeDefKind::Enum)
+                .unwrap_or(false),
+            Type::Applied(name, _) => self
+                .info
+                .types
+                .get(&name)
+                .map(|type_info| type_info.kind != TypeDefKind::Enum)
+                .unwrap_or(false),
+            Type::List(_) | Type::FixedArray(_, _) | Type::Result(_) => true,
+            _ => false,
+        })
+    }
+
+    fn value_size_align(&self, ty: &Type) -> Result<(u64, u64), CompileError> {
+        if self.value_is_pointer(ty)? {
+            let pointer = self.pointer_type.bits() as u64 / 8;
+            return Ok((pointer, pointer));
+        }
+        let ty = crate::codegen::resolve_codegen_aliases(ty, self.info)?;
+        Ok(match ty {
+            Type::Void => (0, 1),
+            Type::Bool | Type::I8 | Type::U8 => (1, 1),
+            Type::I16 | Type::U16 => (2, 2),
+            Type::I32 | Type::U32 | Type::F32 => (4, 4),
+            Type::I64 | Type::U64 | Type::F64 => (8, 8),
+            Type::Isize | Type::Usize => {
+                let pointer = self.pointer_type.bits() as u64 / 8;
+                (pointer, pointer)
+            }
+            Type::Named(name) => {
+                let type_info = self
+                    .info
+                    .types
+                    .get(&name)
+                    .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
+                if type_info.kind == TypeDefKind::Enum {
+                    (4, 4)
+                } else {
+                    let pointer = self.pointer_type.bits() as u64 / 8;
+                    (pointer, pointer)
+                }
+            }
+            Type::Applied(name, _) => self.value_size_align(&Type::Named(name))?,
+            Type::Infer => (4, 4),
+            _ => {
+                let pointer = self.pointer_type.bits() as u64 / 8;
+                (pointer, pointer)
+            }
         })
     }
 
@@ -1970,34 +3631,94 @@ impl<'a> Backend<'a> {
             | Type::Result(_)
             | Type::Error
             | Type::None
-            | Type::FnPtr(_, _)
-            | Type::Applied(_, _) => (pointer, pointer),
+            | Type::FnPtr(_, _) => (pointer, pointer),
             Type::FixedArray(count, inner) => {
-                let (size, align) = self.type_size_align(&inner)?;
+                let (size, align) = self.value_size_align(&inner)?;
                 (size * count, align)
             }
+            Type::Applied(name, _) => self.type_size_align(&Type::Named(name))?,
             Type::Named(name) => {
                 let type_info = self
                     .info
                     .types
                     .get(&name)
                     .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
-                if type_info.kind != TypeDefKind::Struct {
-                    return Err(CompileError::new(format!(
-                        "native backend does not yet support type `{name}`"
-                    )));
+                match type_info.kind {
+                    TypeDefKind::Enum => (4, 4),
+                    TypeDefKind::Struct => {
+                        let mut size = 0u64;
+                        let mut align = 1u64;
+                        for field in &type_info.fields {
+                            let (field_size, field_align) = self.value_size_align(&field.ty)?;
+                            size = align_to(size, field_align) + field_size;
+                            align = align.max(field_align);
+                        }
+                        (align_to(size, align), align)
+                    }
+                    TypeDefKind::Union => {
+                        let mut max_align = 4u64;
+                        let mut max_size = 0u64;
+                        for variant in &type_info.variants {
+                            let mut size = 0u64;
+                            let mut align = 1u64;
+                            for payload in &variant.payload_types {
+                                let (payload_size, payload_align) =
+                                    self.value_size_align(payload)?;
+                                size = align_to(size, payload_align) + payload_size;
+                                align = align.max(payload_align);
+                            }
+                            max_size = max_size.max(align_to(size, align));
+                            max_align = max_align.max(align);
+                        }
+                        let data_offset = align_to(4, max_align);
+                        (align_to(data_offset + max_size, max_align), max_align)
+                    }
                 }
-                let mut size = 0u64;
-                let mut align = 1u64;
-                for field in &type_info.fields {
-                    let (field_size, field_align) = self.type_size_align(&field.ty)?;
-                    size = align_to(size, field_align) + field_size;
-                    align = align.max(field_align);
-                }
-                (align_to(size, align), align)
             }
             Type::Infer => (4, 4),
         })
+    }
+
+    fn union_data_offset(&self, name: &str) -> Result<u64, CompileError> {
+        let type_info = self
+            .info
+            .types
+            .get(name)
+            .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
+        let mut max_align = 4u64;
+        for variant in &type_info.variants {
+            for payload in &variant.payload_types {
+                let (_, align) = self.value_size_align(payload)?;
+                max_align = max_align.max(align);
+            }
+        }
+        Ok(align_to(4, max_align))
+    }
+
+    fn variant_payload_layout(
+        &self,
+        name: &str,
+        variant_name: &str,
+    ) -> Result<(u64, u64, Vec<u64>), CompileError> {
+        let type_info = self
+            .info
+            .types
+            .get(name)
+            .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
+        let payload_types = type_info.variant_map.get(variant_name).ok_or_else(|| {
+            CompileError::new(format!("union `{name}` has no variant `{variant_name}`"))
+        })?;
+        let mut size = 0u64;
+        let mut align = 1u64;
+        let mut offsets = Vec::new();
+        for payload in payload_types {
+            let (payload_size, payload_align) = self.value_size_align(payload)?;
+            size = align_to(size, payload_align);
+            offsets.push(size);
+            size += payload_size;
+            align = align.max(payload_align);
+        }
+        Ok((align_to(size, align), align, offsets))
     }
 
     fn field_type(&self, base_ty: &Type, field: &str) -> Result<Type, CompileError> {
@@ -2039,11 +3760,11 @@ impl<'a> Backend<'a> {
             .ok_or_else(|| CompileError::new(format!("unknown type `{name}`")))?;
         let mut offset = 0u64;
         for field in type_info.fields.iter().take(index) {
-            let (size, align) = self.type_size_align(&field.ty)?;
+            let (size, align) = self.value_size_align(&field.ty)?;
             offset = align_to(offset, align) + size;
         }
         if let Some(field) = type_info.fields.get(index) {
-            let (_, align) = self.type_size_align(&field.ty)?;
+            let (_, align) = self.value_size_align(&field.ty)?;
             offset = align_to(offset, align);
         }
         Ok(offset)
@@ -2077,27 +3798,16 @@ impl<'a> Backend<'a> {
         Ok(func_id)
     }
 
+    fn bind_var(&self, scope: &mut FunctionScope, name: String, var: Variable, ty: Type) {
+        scope.vars.insert(name.clone(), (var, ty.clone()));
+        self.info.scope_overrides.borrow_mut().insert(name, ty);
+    }
+
     fn new_block(&mut self, builder: &mut FunctionBuilder) -> ir::Block {
         let block = builder.create_block();
         self.next_block += 1;
         block
     }
-}
-
-fn is_pointer_value_type(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Named(_)
-            | Type::Applied(_, _)
-            | Type::Ref(_)
-            | Type::Mut(_)
-            | Type::List(_)
-            | Type::FixedArray(_, _)
-            | Type::Result(_)
-            | Type::Error
-            | Type::None
-            | Type::FnPtr(_, _)
-    )
 }
 
 fn current_block_terminated(builder: &FunctionBuilder) -> bool {
@@ -2506,6 +4216,136 @@ pub fn runtime_c() -> &'static str {
     r#"#include <stdint.h>
 #include <stdio.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+
+typedef struct {
+    void *data;
+    int32_t len;
+    int32_t cap;
+} scar_list_header;
+
+void scar_runtime_panic(const char *message) {
+    fprintf(stderr, "scar: panic: %s\n", message ? message : "");
+    exit(1);
+}
+
+static int scar__argc;
+static char **scar__argv;
+
+void scar_set_args(int argc, char **argv) {
+    scar__argc = argc;
+    scar__argv = argv;
+}
+
+static void scar_list__ensure(scar_list_header *list, int32_t requested, size_t elem_size) {
+    if (requested < 0) {
+        scar_runtime_panic("list capacity cannot be negative");
+    }
+    if (requested <= list->cap) {
+        return;
+    }
+    int32_t new_cap = list->cap > 0 ? list->cap : 4;
+    while (new_cap < requested) {
+        if (new_cap > INT32_MAX / 2) {
+            new_cap = requested;
+            break;
+        }
+        new_cap *= 2;
+    }
+    void *resized = realloc(list->data, elem_size * (size_t)new_cap);
+    if (resized == NULL) {
+        scar_runtime_panic("failed to allocate list storage");
+    }
+    list->data = resized;
+    list->cap = new_cap;
+}
+
+void *scar_list_new(void) {
+    scar_list_header *list = malloc(sizeof(scar_list_header));
+    if (list == NULL) {
+        scar_runtime_panic("failed to allocate list");
+    }
+    list->data = NULL;
+    list->len = 0;
+    list->cap = 0;
+    return list;
+}
+
+void *scar_list_at(void *raw, int32_t index, size_t elem_size) {
+    scar_list_header *list = raw;
+    if (index < 0 || index >= list->len) {
+        fprintf(stderr, "scar: panic: list index out of bounds (index %d, len %d)\n", index, list->len);
+        exit(1);
+    }
+    return (char *)list->data + elem_size * (size_t)index;
+}
+
+int32_t scar_list_len(void *raw) {
+    return ((scar_list_header *)raw)->len;
+}
+
+int32_t scar_list_capacity(void *raw) {
+    return ((scar_list_header *)raw)->cap;
+}
+
+void scar_list_reserve(void *raw, int32_t capacity, size_t elem_size) {
+    scar_list__ensure(raw, capacity, elem_size);
+}
+
+void scar_list_append(void *raw, void *value, size_t elem_size) {
+    scar_list_header *list = raw;
+    scar_list__ensure(list, list->len + 1, elem_size);
+    memcpy((char *)list->data + elem_size * (size_t)list->len, value, elem_size);
+    list->len += 1;
+}
+
+void scar_list_set(void *raw, int32_t index, void *value, size_t elem_size) {
+    memcpy(scar_list_at(raw, index, elem_size), value, elem_size);
+}
+
+void scar_list_insert(void *raw, int32_t index, void *value, size_t elem_size) {
+    scar_list_header *list = raw;
+    if (index < 0 || index > list->len) {
+        fprintf(stderr, "scar: panic: list insert index out of bounds (index %d, len %d)\n", index, list->len);
+        exit(1);
+    }
+    scar_list__ensure(list, list->len + 1, elem_size);
+    if (index < list->len) {
+        memmove((char *)list->data + elem_size * (size_t)(index + 1),
+                (char *)list->data + elem_size * (size_t)index,
+                elem_size * (size_t)(list->len - index));
+    }
+    memcpy((char *)list->data + elem_size * (size_t)index, value, elem_size);
+    list->len += 1;
+}
+
+void scar_list_remove(void *raw, int32_t index, void *out, size_t elem_size) {
+    scar_list_header *list = raw;
+    void *slot = scar_list_at(raw, index, elem_size);
+    memcpy(out, slot, elem_size);
+    if (index + 1 < list->len) {
+        memmove(slot,
+                (char *)slot + elem_size,
+                elem_size * (size_t)(list->len - index - 1));
+    }
+    list->len -= 1;
+}
+
+void scar_list_clear(void *raw) {
+    ((scar_list_header *)raw)->len = 0;
+}
+
+void *scar_args_list(void) {
+    scar_list_header *list = scar_list_new();
+    if (scar__argc > 0) {
+        scar_list__ensure(list, scar__argc, sizeof(char *));
+        memcpy(list->data, scar__argv, sizeof(char *) * (size_t)scar__argc);
+        list->len = scar__argc;
+    }
+    return list;
+}
 
 void scar_print_str(const char *s) {
     fputs(s ? s : "", stdout);

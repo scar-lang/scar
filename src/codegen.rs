@@ -2880,7 +2880,8 @@ pub(crate) fn infer_codegen_expr_type(
                 | BinaryOp::NotEqual
                     if common_codegen_numeric_type(&lhs_ty, &rhs_ty).is_some()
                         || (lhs_ty == Type::Bool && rhs_ty == Type::Bool)
-                        || can_codegen_compare_with_none(&lhs_ty, &rhs_ty) =>
+                        || can_codegen_compare_with_none(&lhs_ty, &rhs_ty)
+                        || same_codegen_enum_type(&lhs_ty, &rhs_ty, info) =>
                 {
                     Ok(Type::Bool)
                 }
@@ -3826,40 +3827,39 @@ fn codegen_float_rank(ty: &Type) -> Option<u8> {
 }
 
 fn common_codegen_integer_type(lhs: &Type, rhs: &Type) -> Option<Type> {
-    if lhs == rhs && is_codegen_integer_type(lhs) {
+    if !is_codegen_integer_type(lhs) || !is_codegen_integer_type(rhs) {
+        return None;
+    }
+    if lhs == rhs {
         return Some(lhs.clone());
     }
-    if is_codegen_signed_integer_type(lhs) && is_codegen_signed_integer_type(rhs) {
-        return Some(
-            if codegen_integer_rank(lhs)? >= codegen_integer_rank(rhs)? {
-                lhs.clone()
-            } else {
-                rhs.clone()
-            },
-        );
-    }
-    if is_codegen_unsigned_integer_type(lhs) && is_codegen_unsigned_integer_type(rhs) {
-        return Some(
-            if codegen_integer_rank(lhs)? >= codegen_integer_rank(rhs)? {
-                lhs.clone()
-            } else {
-                rhs.clone()
-            },
-        );
-    }
-    if is_codegen_unsigned_integer_type(lhs)
-        && is_codegen_signed_integer_type(rhs)
-        && codegen_integer_rank(lhs)? > codegen_integer_rank(rhs)?
-    {
+    let lhs_rank = codegen_integer_rank(lhs)?;
+    let rhs_rank = codegen_integer_rank(rhs)?;
+    if lhs_rank > rhs_rank {
         return Some(lhs.clone());
     }
-    if is_codegen_signed_integer_type(lhs)
-        && is_codegen_unsigned_integer_type(rhs)
-        && codegen_integer_rank(rhs)? > codegen_integer_rank(lhs)?
-    {
+    if rhs_rank > lhs_rank {
         return Some(rhs.clone());
     }
-    None
+    if is_codegen_unsigned_integer_type(lhs) {
+        Some(lhs.clone())
+    } else {
+        Some(rhs.clone())
+    }
+}
+
+fn same_codegen_enum_type(lhs: &Type, rhs: &Type, info: &ProgramInfo) -> bool {
+    if lhs != rhs {
+        return false;
+    }
+    let name = match lhs {
+        Type::Named(name) => name,
+        Type::Applied(name, _) => name,
+        _ => return false,
+    };
+    info.types
+        .get(name)
+        .is_some_and(|type_info| type_info.kind == TypeDefKind::Enum)
 }
 
 pub(crate) fn common_codegen_numeric_type(lhs: &Type, rhs: &Type) -> Option<Type> {
