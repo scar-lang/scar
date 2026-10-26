@@ -183,7 +183,7 @@ fn print_help() {
     println!("Usage: scar <command> [options]");
     println!();
     println!("Commands:");
-    println!("  build <file.scar>    Build a native executable via CLIF");
+    println!("  build <file.scar>    Build a native executable");
     println!("  wasm  <file.scar>    Compile to WebAssembly");
     println!("  ast   <file.scar>    Print the parsed AST");
     println!("  run   <file.scar>    Compile and run a program");
