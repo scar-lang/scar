@@ -717,12 +717,7 @@ fn render_stmt_inner<'a>(
         } => {
             let ty = declared_type
                 .clone()
-                .or_else(|| {
-                    info.scope_overrides
-                        .borrow()
-                        .get(name)
-                        .cloned()
-                })
+                .or_else(|| info.scope_overrides.borrow().get(name).cloned())
                 .or_else(|| {
                     info.locals
                         .get(&function.name)
@@ -735,7 +730,9 @@ fn render_stmt_inner<'a>(
                         function.name
                     ))
                 })?;
-            info.scope_overrides.borrow_mut().insert(name.clone(), ty.clone());
+            info.scope_overrides
+                .borrow_mut()
+                .insert(name.clone(), ty.clone());
             let ty_ref = &ty;
             if let Expr::Try(inner) = init {
                 let result_ty = infer_codegen_expr_type(inner, function, info)?;
@@ -1243,10 +1240,8 @@ fn render_stmt_inner<'a>(
                                     "result-style match arms are not supported for enum code generation",
                                 ));
                             };
-                            let bare_variant = variant_name
-                                .rsplit('.')
-                                .next()
-                                .unwrap_or(variant_name);
+                            let bare_variant =
+                                variant_name.rsplit('.').next().unwrap_or(variant_name);
                             if bare_variant == "_" {
                                 indent(output, level + 1);
                                 output.push_str("else {\n");
@@ -1304,10 +1299,8 @@ fn render_stmt_inner<'a>(
                                     "result-style match arms are not supported for union code generation",
                                 ));
                             };
-                            let bare_variant = variant_name
-                                .rsplit('.')
-                                .next()
-                                .unwrap_or(variant_name);
+                            let bare_variant =
+                                variant_name.rsplit('.').next().unwrap_or(variant_name);
                             if bare_variant == "_" {
                                 indent(output, level + 1);
                                 output.push_str("else {\n");
@@ -1371,7 +1364,9 @@ fn render_stmt_inner<'a>(
                             let saved_overrides = info.scope_overrides.borrow().clone();
                             {
                                 let mut overrides = info.scope_overrides.borrow_mut();
-                                for (binding, payload_ty) in arm.bindings.iter().zip(payload_types.iter()) {
+                                for (binding, payload_ty) in
+                                    arm.bindings.iter().zip(payload_types.iter())
+                                {
                                     if let Some(binding) = binding {
                                         overrides.insert(binding.clone(), payload_ty.clone());
                                     }
@@ -2610,10 +2605,7 @@ fn render_list_literal(
         .collect::<Result<Vec<_>, _>>()?;
     let mut code = format!("({helper_prefix}_new()");
     for rv in &rendered_values {
-        code.push_str(&format!(
-            ", ({helper_prefix}_append(&__l, {}), __l)",
-            rv
-        ));
+        code.push_str(&format!(", ({helper_prefix}_append(&__l, {}), __l)", rv));
     }
     code.push(')');
     Ok(format!(
@@ -2624,7 +2616,7 @@ fn render_list_literal(
     ))
 }
 
-fn infer_codegen_expr_type(
+pub(crate) fn infer_codegen_expr_type(
     expr: &Expr,
     function: &Function,
     info: &ProgramInfo,
@@ -3704,7 +3696,7 @@ fn c_type(ty: &Type) -> String {
     }
 }
 
-fn list_element_type(ty: &Type) -> Result<&Type, CompileError> {
+pub(crate) fn list_element_type(ty: &Type) -> Result<&Type, CompileError> {
     match deref_refs(ty) {
         Type::List(inner) => Ok(inner),
         other => Err(CompileError::new(format!(
@@ -3797,14 +3789,14 @@ fn is_codegen_signed_numeric_type(ty: &Type) -> bool {
     is_codegen_signed_integer_type(ty) || matches!(ty, Type::F32 | Type::F64)
 }
 
-fn is_codegen_signed_integer_type(ty: &Type) -> bool {
+pub(crate) fn is_codegen_signed_integer_type(ty: &Type) -> bool {
     matches!(
         ty,
         Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize
     )
 }
 
-fn is_codegen_unsigned_integer_type(ty: &Type) -> bool {
+pub(crate) fn is_codegen_unsigned_integer_type(ty: &Type) -> bool {
     matches!(
         ty,
         Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Usize
@@ -3870,7 +3862,7 @@ fn common_codegen_integer_type(lhs: &Type, rhs: &Type) -> Option<Type> {
     None
 }
 
-fn common_codegen_numeric_type(lhs: &Type, rhs: &Type) -> Option<Type> {
+pub(crate) fn common_codegen_numeric_type(lhs: &Type, rhs: &Type) -> Option<Type> {
     if let Some(common) = common_codegen_integer_type(lhs, rhs) {
         return Some(common);
     }
@@ -3887,7 +3879,7 @@ fn common_codegen_numeric_type(lhs: &Type, rhs: &Type) -> Option<Type> {
     None
 }
 
-fn unsigned_c_type(ty: &Type) -> Option<&'static str> {
+pub(crate) fn unsigned_c_type(ty: &Type) -> Option<&'static str> {
     match ty {
         Type::I8 => Some("uint8_t"),
         Type::I16 => Some("uint16_t"),
@@ -4003,7 +3995,7 @@ fn render_print_value(
     }
 }
 
-fn resolve_codegen_aliases(ty: &Type, info: &ProgramInfo) -> Result<Type, CompileError> {
+pub(crate) fn resolve_codegen_aliases(ty: &Type, info: &ProgramInfo) -> Result<Type, CompileError> {
     match ty {
         Type::Named(name) => {
             let Some(type_info) = info.types.get(name) else {
@@ -4032,7 +4024,7 @@ fn resolve_codegen_aliases(ty: &Type, info: &ProgramInfo) -> Result<Type, Compil
     }
 }
 
-fn deref_refs(mut ty: &Type) -> &Type {
+pub(crate) fn deref_refs(mut ty: &Type) -> &Type {
     loop {
         match ty {
             Type::Ref(inner) | Type::Mut(inner) => ty = inner,
@@ -4056,7 +4048,7 @@ fn escape_c_string(value: &str) -> String {
     escaped
 }
 
-fn is_integer_codegen_type(ty: &Type) -> bool {
+pub(crate) fn is_integer_codegen_type(ty: &Type) -> bool {
     matches!(
         ty,
         Type::I8
@@ -4072,7 +4064,7 @@ fn is_integer_codegen_type(ty: &Type) -> bool {
     )
 }
 
-fn describe_type(ty: &Type) -> String {
+pub(crate) fn describe_type(ty: &Type) -> String {
     match ty {
         Type::Void => "void".to_string(),
         Type::Bool => "bool".to_string(),
@@ -4153,7 +4145,7 @@ fn c_type_mut(ty: &Type) -> String {
     }
 }
 
-fn is_reference_like(ty: &Type) -> bool {
+pub(crate) fn is_reference_like(ty: &Type) -> bool {
     matches!(ty, Type::Ref(_))
         || matches!(ty, Type::Mut(inner) if matches!(inner.as_ref(), Type::Ref(_)))
 }

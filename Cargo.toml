@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cranelift-codegen = "0.128"
+cranelift-frontend = "0.128"
+cranelift-module = "0.128"
+cranelift-native = "0.128"
+cranelift-object = "0.128"
+target-lexicon = "0.13.5"
+wat = "1"

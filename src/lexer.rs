@@ -188,12 +188,29 @@ impl Lexer {
                                 self.bump();
                                 if let Some(next_ch) = self.peek() {
                                     match next_ch {
-                                        'n' => { self.bump(); value.push('\n'); }
-                                        't' => { self.bump(); value.push('\t'); }
-                                        'r' => { self.bump(); value.push('\r'); }
-                                        '"' => { self.bump(); value.push('\"'); }
-                                        '\\' => { self.bump(); value.push('\\'); }
-                                        _ => { value.push('\\'); }
+                                        'n' => {
+                                            self.bump();
+                                            value.push('\n');
+                                        }
+                                        't' => {
+                                            self.bump();
+                                            value.push('\t');
+                                        }
+                                        'r' => {
+                                            self.bump();
+                                            value.push('\r');
+                                        }
+                                        '"' => {
+                                            self.bump();
+                                            value.push('\"');
+                                        }
+                                        '\\' => {
+                                            self.bump();
+                                            value.push('\\');
+                                        }
+                                        _ => {
+                                            value.push('\\');
+                                        }
                                     }
                                 } else {
                                     value.push('\\');
@@ -642,11 +659,13 @@ impl Lexer {
                 return Err(self.error("hex literal has no digits"));
             }
             let value = u64::from_str_radix(&digits, 16).map_err(|error| {
-                CompileError::new(format!(
-                    "invalid hex literal at {line}:{column}: {error}"
-                ))
+                CompileError::new(format!("invalid hex literal at {line}:{column}: {error}"))
             })?;
-            return Ok(Token { kind: TokenKind::Int(value), line, column });
+            return Ok(Token {
+                kind: TokenKind::Int(value),
+                line,
+                column,
+            });
         }
 
         if self.peek() == Some('0') && matches!(self.peek_next(), Some('b' | 'B')) {
@@ -668,21 +687,26 @@ impl Lexer {
                     "invalid binary literal at {line}:{column}: {error}"
                 ))
             })?;
-            return Ok(Token { kind: TokenKind::Int(value), line, column });
+            return Ok(Token {
+                kind: TokenKind::Int(value),
+                line,
+                column,
+            });
         }
 
         while matches!(self.peek(), Some('0'..='9')) {
             self.bump();
         }
-        let is_float = self.peek() == Some('.')
-            && matches!(self.peek_next(), Some('0'..='9'));
+        let is_float = self.peek() == Some('.') && matches!(self.peek_next(), Some('0'..='9'));
         if is_float {
             self.bump();
             while matches!(self.peek(), Some('0'..='9')) {
                 self.bump();
             }
         }
-        if matches!(self.peek(), Some('e' | 'E')) && matches!(self.peek_next(), Some('0'..='9' | '+' | '-')) {
+        if matches!(self.peek(), Some('e' | 'E'))
+            && matches!(self.peek_next(), Some('0'..='9' | '+' | '-'))
+        {
             self.bump();
             if matches!(self.peek(), Some('+' | '-')) {
                 self.bump();
@@ -854,32 +878,58 @@ mod tests {
     fn lexes_double_colon() {
         let tokens = lex("extern def sleep() void :: \"sleep\"\n").unwrap();
 
-        assert!(tokens.iter().any(|token| matches!(token.kind, TokenKind::ColonColon)));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token.kind, TokenKind::ColonColon))
+        );
     }
 
     #[test]
     fn lexes_char_literals_and_postfix_operators() {
         let tokens = lex("val a = 'a'\nvalue++\nother--\nval nl = '\\n'\n").unwrap();
 
-        assert!(tokens.iter().any(|token| matches!(token.kind, TokenKind::Char(b'a'))));
-        assert!(tokens
-            .iter()
-            .any(|token| matches!(token.kind, TokenKind::Char(value) if value == b'\n')));
-        assert!(tokens.iter().any(|token| matches!(token.kind, TokenKind::PlusPlus)));
-        assert!(tokens.iter().any(|token| matches!(token.kind, TokenKind::MinusMinus)));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token.kind, TokenKind::Char(b'a')))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token.kind, TokenKind::Char(value) if value == b'\n'))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token.kind, TokenKind::PlusPlus))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token.kind, TokenKind::MinusMinus))
+        );
     }
 
     #[test]
     fn lexes_break_keyword() {
         let tokens = lex("for\n\tbreak\nend\n").unwrap();
 
-        assert!(tokens.iter().any(|token| matches!(token.kind, TokenKind::Break)));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token.kind, TokenKind::Break))
+        );
     }
 
     #[test]
     fn lexes_when_keyword() {
         let tokens = lex("when linux\nend\n").unwrap();
 
-        assert!(tokens.iter().any(|token| matches!(token.kind, TokenKind::When)));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token.kind, TokenKind::When))
+        );
     }
 }

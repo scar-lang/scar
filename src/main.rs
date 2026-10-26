@@ -1,9 +1,11 @@
 mod ast;
+mod clif;
 mod codegen;
 mod lexer;
 mod parser;
 mod resolver;
 mod sema;
+mod wasm;
 
 use std::{
     collections::hash_map::DefaultHasher,
@@ -15,6 +17,8 @@ use std::{
 
 use ast::{Expr, Function, Program, Stmt, Type};
 use codegen::generate_c;
+use lexer::lex;
+use parser::parse_program;
 use resolver::resolve_entry_program;
 use sema::analyze;
 
@@ -149,9 +153,30 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<(), CompileErrors> {
     match cli {
         Cli::Build(cli) => run_build(cli),
+        Cli::Wasm(cli) => run_wasm_command(cli),
+        Cli::Ast(cli) => run_ast_command(cli),
         Cli::Run(cli) => run_run_command(cli),
         Cli::Test(cli) => run_test_command(cli),
+        Cli::Help => {
+            print_help();
+            Ok(())
+        }
     }
+}
+
+fn print_help() {
+    println!(
+        "Scar compiler\n\
+\n\
+Usage:\n\
+  scar build <file.scar> [-opt] [-o output]   Build a native executable (Cranelift)\n\
+  scar build <file.scar> -c [-opt] [-o out]   Build using the legacy C backend\n\
+  scar wasm <file.scar> [-opt] [-o out.wasm]  Compile to WebAssembly\n\
+  scar ast <file.scar>                        Print the parsed AST\n\
+  scar run <file.scar>                        Compile and run a program\n\
+  scar test <file|dir> [-opt]                 Run test blocks\n\
+  scar help                                   Show this help message"
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,27 +187,39 @@ struct SourceLocation {
 
 enum Cli {
     Build(BuildCli),
+    Wasm(WasmCli),
+    Ast(AstCli),
     Run(RunCli),
     Test(TestCli),
+    Help,
 }
 
 impl Cli {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, CompileError> {
         let args: Vec<String> = args.collect();
-        if args.first().is_some_and(|arg| arg == "run") {
-            Ok(Self::Run(RunCli::parse(args.into_iter().skip(1))?))
-        } else if args.first().is_some_and(|arg| arg == "test") {
-            Ok(Self::Test(TestCli::parse(args.into_iter().skip(1))?))
-        } else {
-            Ok(Self::Build(BuildCli::parse(args.into_iter())?))
+        let Some(command) = args.first() else {
+            return Ok(Self::Help);
+        };
+        match command.as_str() {
+            "build" => Ok(Self::Build(BuildCli::parse(args.into_iter().skip(1))?)),
+            "wasm" => Ok(Self::Wasm(WasmCli::parse(args.into_iter().skip(1))?)),
+            "ast" => Ok(Self::Ast(AstCli::parse(args.into_iter().skip(1))?)),
+            "run" => Ok(Self::Run(RunCli::parse(args.into_iter().skip(1))?)),
+            "test" => Ok(Self::Test(TestCli::parse(args.into_iter().skip(1))?)),
+            "help" | "-h" | "--help" => Ok(Self::Help),
+            _ if command.ends_with(".scar") => Ok(Self::Build(BuildCli::parse(args.into_iter())?)),
+            _ => Ok(Self::Help),
         }
     }
 
     fn default_error_path(&self) -> Option<&Path> {
         match self {
             Cli::Build(cli) => Some(&cli.input),
+            Cli::Wasm(cli) => Some(&cli.input),
+            Cli::Ast(cli) => Some(&cli.input),
             Cli::Run(cli) => Some(&cli.input),
             Cli::Test(cli) => Some(&cli.target),
+            Cli::Help => None,
         }
     }
 }
@@ -191,6 +228,7 @@ struct BuildCli {
     input: PathBuf,
     output: PathBuf,
     emit_c: bool,
+    use_c: bool,
     optimize: bool,
 }
 
@@ -200,6 +238,7 @@ impl BuildCli {
         let mut output = None;
         let mut pending_output = false;
         let mut emit_c = false;
+        let mut use_c = false;
         let mut optimize = false;
 
         for arg in args {
@@ -211,7 +250,68 @@ impl BuildCli {
 
             match arg.as_str() {
                 "-o" | "--output" => pending_output = true,
+                "-opt" | "--opt" => optimize = true,
+                "-c" | "--c-backend" => use_c = true,
                 "--emit" | "-emit" => emit_c = true,
+                _ if arg.starts_with('-') => {
+                    return Err(CompileError::new(format!("unknown flag: {arg}")));
+                }
+                _ => {
+                    if input.is_some() {
+                        return Err(CompileError::new(
+                            "expected a single input file and optional -o/--output path",
+                        ));
+                    }
+                    input = Some(PathBuf::from(arg));
+                }
+            }
+        }
+
+        if pending_output {
+            return Err(CompileError::new("expected a path after -o/--output"));
+        }
+        if emit_c {
+            use_c = true;
+        }
+
+        let input = input.ok_or_else(|| {
+            CompileError::new("usage: scar build <input.scar> [-opt] [-c] [-o output]")
+        })?;
+        let output = match output {
+            Some(output) => output,
+            None => default_output_path(&input, emit_c)?,
+        };
+        Ok(Self {
+            input,
+            output,
+            emit_c,
+            use_c,
+            optimize,
+        })
+    }
+}
+
+struct WasmCli {
+    input: PathBuf,
+    output: PathBuf,
+    optimize: bool,
+}
+
+impl WasmCli {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, CompileError> {
+        let mut input = None;
+        let mut output = None;
+        let mut pending_output = false;
+        let mut optimize = false;
+
+        for arg in args {
+            if pending_output {
+                output = Some(PathBuf::from(arg));
+                pending_output = false;
+                continue;
+            }
+            match arg.as_str() {
+                "-o" | "--output" => pending_output = true,
                 "-opt" | "--opt" => optimize = true,
                 _ if arg.starts_with('-') => {
                     return Err(CompileError::new(format!("unknown flag: {arg}")));
@@ -230,19 +330,38 @@ impl BuildCli {
         if pending_output {
             return Err(CompileError::new("expected a path after -o/--output"));
         }
-
         let input = input.ok_or_else(|| {
-            CompileError::new("usage: scar <input.scar> [--emit] [-opt] [-o output]")
+            CompileError::new("usage: scar wasm <input.scar> [-opt] [-o output.wasm]")
         })?;
-        let output = match output {
-            Some(output) => output,
-            None => default_output_path(&input, emit_c)?,
-        };
+        let output = output.unwrap_or_else(|| default_wasm_output_path(&input));
         Ok(Self {
             input,
             output,
-            emit_c,
             optimize,
+        })
+    }
+}
+
+struct AstCli {
+    input: PathBuf,
+}
+
+impl AstCli {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, CompileError> {
+        let mut input = None;
+        for arg in args {
+            if arg.starts_with('-') {
+                return Err(CompileError::new(format!("unknown flag: {arg}")));
+            }
+            if input.is_some() {
+                return Err(CompileError::new(
+                    "expected a single input file after `scar ast`",
+                ));
+            }
+            input = Some(PathBuf::from(arg));
+        }
+        Ok(Self {
+            input: input.ok_or_else(|| CompileError::new("usage: scar ast <input.scar>"))?,
         })
     }
 }
@@ -366,6 +485,22 @@ fn write_output(path: &Path, contents: &str) -> Result<(), CompileError> {
         .map_err(|error| CompileError::new(format!("failed to write {}: {error}", path.display())))
 }
 
+fn write_output_bytes(path: &Path, contents: &[u8]) -> Result<(), CompileError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            CompileError::new(format!(
+                "failed to create output directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    fs::write(path, contents)
+        .map_err(|error| CompileError::new(format!("failed to write {}: {error}", path.display())))
+}
+
 fn run_build(cli: &BuildCli) -> Result<(), CompileErrors> {
     let program = resolve_entry_program(&cli.input).map_err(CompileErrors::single)?;
     let info = analyze(&program)?;
@@ -375,32 +510,52 @@ fn run_build(cli: &BuildCli) -> Result<(), CompileErrors> {
         &cli.input,
         &cli.output,
         cli.emit_c,
+        cli.use_c,
         cli.optimize,
     )
     .map_err(CompileErrors::single)?;
     Ok(())
 }
 
+fn run_wasm_command(cli: &WasmCli) -> Result<(), CompileErrors> {
+    let program = resolve_entry_program(&cli.input).map_err(CompileErrors::single)?;
+    let info = analyze(&program)?;
+    let bytes = wasm::compile_wasm(&program, &info, cli.optimize).map_err(CompileErrors::single)?;
+    write_output_bytes(&cli.output, &bytes).map_err(CompileErrors::single)?;
+    Ok(())
+}
+
+fn run_ast_command(cli: &AstCli) -> Result<(), CompileErrors> {
+    let source = fs::read_to_string(&cli.input).map_err(|error| {
+        CompileErrors::single(CompileError::new(format!(
+            "failed to read {}: {error}",
+            cli.input.display()
+        )))
+    })?;
+    let tokens = lex(&source).map_err(CompileErrors::single)?;
+    let program = parse_program(tokens).map_err(CompileErrors::single)?;
+    println!("{program:#?}");
+    Ok(())
+}
+
 fn run_run_command(cli: &RunCli) -> Result<(), CompileErrors> {
     let program = resolve_entry_program(&cli.input).map_err(CompileErrors::single)?;
     let info = analyze(&program)?;
-    let generated = generate_c(&program, &info, true).map_err(CompileErrors::single)?;
-    let c_path = temporary_c_path(&cli.input);
     let binary_path = temporary_run_binary_path(&cli.input);
 
     let result = (|| {
-        write_output(&c_path, &generated)?;
-        compile_c_to_binary(
-            &c_path,
+        emit_program(
+            &program,
+            &info,
+            &cli.input,
             &binary_path,
             false,
-            CompileMode::FastRun,
-            &program.link_flags,
+            false,
+            false,
         )?;
         run_program_binary(&binary_path)
     })();
 
-    let _ = fs::remove_file(&c_path);
     let _ = fs::remove_file(&binary_path);
     result.map_err(CompileErrors::single)
 }
@@ -411,27 +566,226 @@ fn emit_program(
     input: &Path,
     output: &Path,
     emit_c: bool,
+    use_c: bool,
     optimize: bool,
 ) -> Result<(), CompileError> {
-    let generated = generate_c(program, info, !optimize)?;
-    if emit_c {
-        write_output(output, &generated)?;
-    } else {
-        let c_path = temporary_c_path(input);
-        let result = (|| {
-            write_output(&c_path, &generated)?;
-            compile_c_to_binary(
-                &c_path,
-                output,
-                optimize,
-                CompileMode::Standard,
-                &program.link_flags,
-            )
-        })();
-        let _ = fs::remove_file(&c_path);
-        result?;
+    if emit_c || use_c {
+        let generated = generate_c(program, info, !optimize)?;
+        if emit_c {
+            write_output(output, &generated)?;
+        } else {
+            let c_path = temporary_c_path(input);
+            let result = (|| {
+                write_output(&c_path, &generated)?;
+                compile_c_to_binary(
+                    &c_path,
+                    output,
+                    optimize,
+                    CompileMode::Standard,
+                    &program.link_flags,
+                )
+            })();
+            let _ = fs::remove_file(&c_path);
+            result?;
+        }
+        return Ok(());
     }
-    Ok(())
+
+    match compile_native_to_binary(program, info, output, optimize) {
+        Ok(()) => Ok(()),
+        Err(native_error) => {
+            if env::var_os("SCAR_DEBUG_BACKEND").is_some() {
+                eprintln!("scar: native backend fallback: {native_error}");
+            }
+            let generated = generate_c(program, info, !optimize).map_err(|c_error| {
+                CompileError::new(format!(
+                    "native backend failed ({native_error}); C fallback failed ({c_error})"
+                ))
+            })?;
+            let c_path = temporary_c_path(input);
+            let result = (|| {
+                write_output(&c_path, &generated)?;
+                compile_c_to_binary(
+                    &c_path,
+                    output,
+                    optimize,
+                    CompileMode::Standard,
+                    &program.link_flags,
+                )
+            })();
+            let _ = fs::remove_file(&c_path);
+            result
+        }
+    }
+}
+
+fn compile_native_to_binary(
+    program: &Program,
+    info: &sema::ProgramInfo,
+    output: &Path,
+    optimize: bool,
+) -> Result<(), CompileError> {
+    let artifact = clif::compile_object(program, info, optimize)?;
+    let object_path = temporary_object_path(output, artifact.object_extension);
+    let runtime_c_path = temporary_runtime_c_path(output);
+    let runtime_object_path = temporary_runtime_object_path(output, artifact.object_extension);
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            CompileError::new(format!(
+                "failed to create output directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    fs::write(&object_path, &artifact.object).map_err(|error| {
+        CompileError::new(format!(
+            "failed to write {}: {error}",
+            object_path.display()
+        ))
+    })?;
+    write_output(&runtime_c_path, clif::runtime_c())?;
+    let result = (|| {
+        compile_c_to_object(&runtime_c_path, &runtime_object_path, optimize)?;
+        link_objects(
+            &[object_path.clone(), runtime_object_path.clone()],
+            output,
+            &program.link_flags,
+        )
+    })();
+    let _ = fs::remove_file(&object_path);
+    let _ = fs::remove_file(&runtime_c_path);
+    let _ = fs::remove_file(&runtime_object_path);
+    result
+}
+
+fn compile_c_to_object(
+    source_path: &Path,
+    object_path: &Path,
+    optimize: bool,
+) -> Result<(), CompileError> {
+    let candidates: &[(&str, bool)] = if cfg!(windows) {
+        &[
+            ("clang", false),
+            ("gcc", false),
+            ("cc", false),
+            ("cl", true),
+        ]
+    } else {
+        &[("cc", false), ("clang", false), ("gcc", false)]
+    };
+    let mut last_error = None;
+    for (compiler, is_cl) in candidates {
+        if !command_available(compiler) {
+            continue;
+        }
+        let mut command = Command::new(compiler);
+        if *is_cl {
+            command.arg("/c");
+            command.arg(source_path);
+            command.arg(format!("/Fo{}", object_path.display()));
+            command.arg(if optimize { "/O2" } else { "/Od" });
+        } else {
+            command.arg("-std=c99");
+            command.arg(if optimize { "-O2" } else { "-O0" });
+            command.arg("-c");
+            command.arg(source_path);
+            command.arg("-o");
+            command.arg(object_path);
+        }
+        match command.status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = Some(format!(
+                    "{compiler} exited with status {status} while compiling runtime"
+                ));
+            }
+            Err(error) => {
+                last_error = Some(format!("failed to run {compiler}: {error}"));
+            }
+        }
+    }
+    Err(CompileError::new(last_error.unwrap_or_else(|| {
+        "no C toolchain was found for the native runtime".to_string()
+    })))
+}
+
+fn link_objects(
+    object_paths: &[PathBuf],
+    output_path: &Path,
+    link_flags: &[String],
+) -> Result<(), CompileError> {
+    let candidates: &[(&str, bool)] = if cfg!(windows) {
+        &[
+            ("clang", false),
+            ("gcc", false),
+            ("cc", false),
+            ("cl", true),
+        ]
+    } else {
+        &[("cc", false), ("clang", false), ("gcc", false)]
+    };
+    let mut last_error = None;
+    for (compiler, is_cl) in candidates {
+        if !command_available(compiler) {
+            continue;
+        }
+        let mut command = Command::new(compiler);
+        if *is_cl {
+            for object in object_paths {
+                command.arg(object);
+            }
+            command.arg(format!("/Fe:{}", output_path.display()));
+            command.arg("/link");
+            for flag in link_flags {
+                command.arg(flag);
+            }
+        } else {
+            for object in object_paths {
+                command.arg(object);
+            }
+            command.arg("-o");
+            command.arg(output_path);
+            if cfg!(target_os = "macos") {
+                command.arg("-Wl,-w");
+            }
+            for flag in link_flags {
+                command.arg(flag);
+            }
+        }
+        match command.status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = Some(format!(
+                    "{compiler} exited with status {status} while linking {}",
+                    output_path.display()
+                ));
+            }
+            Err(error) => {
+                last_error = Some(format!("failed to run {compiler}: {error}"));
+            }
+        }
+    }
+    Err(CompileError::new(last_error.unwrap_or_else(|| {
+        "no system linker or C toolchain was found for native linking".to_string()
+    })))
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+        || Command::new(command)
+            .arg("-v")
+            .output()
+            .map(|output| {
+                output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty()
+            })
+            .unwrap_or(false)
 }
 
 fn run_test_command(cli: &TestCli) -> Result<(), CompileErrors> {
@@ -784,6 +1138,45 @@ fn default_output_path(input: &Path, emit_c: bool) -> Result<PathBuf, CompileErr
     Ok(output)
 }
 
+fn default_wasm_output_path(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("scar-output");
+    let mut output = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    output.push("scar-out");
+    output.push(format!("{stem}.wasm"));
+    output
+}
+
+fn temporary_object_path(output: &Path, extension: &str) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("scar-object");
+    env::temp_dir().join(format!("scar-{stem}-{}.{}", std::process::id(), extension))
+}
+
+fn temporary_runtime_c_path(output: &Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("scar-runtime");
+    env::temp_dir().join(format!("scar-runtime-{stem}-{}.c", std::process::id()))
+}
+
+fn temporary_runtime_object_path(output: &Path, extension: &str) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("scar-runtime");
+    env::temp_dir().join(format!(
+        "scar-runtime-{stem}-{}.{}",
+        std::process::id(),
+        extension
+    ))
+}
+
 fn temporary_c_path(input: &Path) -> PathBuf {
     let stem = input
         .file_stem()
@@ -911,19 +1304,20 @@ fn parse_location_suffix(message: &str) -> Option<(&str, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, CompileMode, CompilerKind, RunCli, TestCli, choose_compiler, default_output_path,
-        extra_compiler_flags,
+        AstCli, Cli, CompileMode, CompilerKind, RunCli, TestCli, WasmCli, choose_compiler,
+        default_output_path, default_wasm_output_path, extra_compiler_flags,
     };
     use std::{env, path::Path};
 
     #[test]
     fn cli_defaults_to_binary_output() {
-        let cli = Cli::parse(["main.scar".to_string()].into_iter()).unwrap();
+        let cli = Cli::parse(["build".to_string(), "main.scar".to_string()].into_iter()).unwrap();
         let Cli::Build(cli) = cli else {
             panic!("expected build cli");
         };
 
         assert!(!cli.emit_c);
+        assert!(!cli.use_c);
         assert_eq!(
             cli.output,
             default_output_path(Path::new("main.scar"), false).unwrap()
@@ -931,14 +1325,104 @@ mod tests {
     }
 
     #[test]
+    fn bare_source_path_still_builds() {
+        let cli = Cli::parse(["main.scar".to_string()].into_iter()).unwrap();
+        assert!(matches!(cli, Cli::Build(_)));
+    }
+
+    #[test]
     fn cli_emit_uses_c_output() {
-        let cli = Cli::parse(["--emit".to_string(), "main.scar".to_string()].into_iter()).unwrap();
+        let cli = Cli::parse(
+            [
+                "build".to_string(),
+                "--emit".to_string(),
+                "main.scar".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
         let Cli::Build(cli) = cli else {
             panic!("expected build cli");
         };
 
         assert!(cli.emit_c);
+        assert!(cli.use_c);
         assert_eq!(cli.output, Path::new("main.c"));
+    }
+
+    #[test]
+    fn cli_parses_c_backend_flag() {
+        let cli = Cli::parse(
+            [
+                "build".to_string(),
+                "main.scar".to_string(),
+                "-c".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Cli::Build(cli) = cli else {
+            panic!("expected build cli");
+        };
+        assert!(cli.use_c);
+        assert!(!cli.emit_c);
+    }
+
+    #[test]
+    fn cli_parses_wasm_subcommand() {
+        let cli = Cli::parse(
+            [
+                "wasm".to_string(),
+                "main.scar".to_string(),
+                "-o".to_string(),
+                "out.wasm".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Cli::Wasm(WasmCli {
+            input,
+            output,
+            optimize,
+        }) = cli
+        else {
+            panic!("expected wasm cli");
+        };
+        assert_eq!(input, Path::new("main.scar"));
+        assert_eq!(output, Path::new("out.wasm"));
+        assert!(!optimize);
+    }
+
+    #[test]
+    fn cli_parses_ast_subcommand() {
+        let cli = Cli::parse(["ast".to_string(), "main.scar".to_string()].into_iter()).unwrap();
+        let Cli::Ast(AstCli { input }) = cli else {
+            panic!("expected ast cli");
+        };
+        assert_eq!(input, Path::new("main.scar"));
+    }
+
+    #[test]
+    fn cli_shows_help_for_unknown_or_missing_commands() {
+        assert!(matches!(Cli::parse(std::iter::empty()).unwrap(), Cli::Help));
+        assert!(matches!(
+            Cli::parse(["nonsense".to_string()].into_iter()).unwrap(),
+            Cli::Help
+        ));
+        assert!(matches!(
+            Cli::parse(["help".to_string()].into_iter()).unwrap(),
+            Cli::Help
+        ));
+    }
+
+    #[test]
+    fn default_wasm_output_is_under_scar_out() {
+        let output = default_wasm_output_path(Path::new("nested/main.scar"));
+        assert_eq!(
+            output.file_name().and_then(|name| name.to_str()),
+            Some("main.wasm")
+        );
+        assert!(output.starts_with(env::current_dir().unwrap().join("scar-out")));
     }
 
     #[test]

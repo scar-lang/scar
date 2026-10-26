@@ -1178,7 +1178,9 @@ fn rewrite_expr(
                     if let Some(mapped) = local_functions.get(&path[0]) {
                         return Ok(Expr::Path(vec![mapped.clone()]));
                     }
-                    if let Some(mapped) = LOCAL_GLOBALS.with(|lg| lg.borrow().get(&path[0]).cloned()) {
+                    if let Some(mapped) =
+                        LOCAL_GLOBALS.with(|lg| lg.borrow().get(&path[0]).cloned())
+                    {
                         return Ok(Expr::Path(vec![mapped.clone()]));
                     }
                 }
@@ -1269,12 +1271,7 @@ fn rewrite_expr(
                     }
                 }
             }
-            let rewritten_base = rewrite_expr(
-                *base,
-                local_functions,
-                local_types,
-                module_aliases,
-            )?;
+            let rewritten_base = rewrite_expr(*base, local_functions, local_types, module_aliases)?;
             if let Expr::Path(ref path) = rewritten_base {
                 if path.len() == 1 {
                     let qualified = format!("{}.{}", path[0], field);

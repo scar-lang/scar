@@ -862,11 +862,7 @@ impl Parser {
             let body = self.parse_block()?;
             self.expect_simple(TokenKind::End)?;
             self.consume_newlines();
-            return Ok(Stmt::Defer {
-                line,
-                column,
-                body,
-            });
+            return Ok(Stmt::Defer { line, column, body });
         }
 
         if self.check_simple(&TokenKind::If) {
@@ -1472,7 +1468,10 @@ impl Parser {
 
     fn parse_logical_or(&mut self) -> Result<Expr, CompileError> {
         let mut expr = self.parse_logical_and()?;
-        while self.next_non_newline_kind(self.pos).is_some_and(|k| matches!(k, TokenKind::PipePipe)) {
+        while self
+            .next_non_newline_kind(self.pos)
+            .is_some_and(|k| matches!(k, TokenKind::PipePipe))
+        {
             self.consume_newlines();
             self.advance();
             self.consume_newlines();
@@ -1488,7 +1487,10 @@ impl Parser {
 
     fn parse_logical_and(&mut self) -> Result<Expr, CompileError> {
         let mut expr = self.parse_bitwise_or()?;
-        while self.next_non_newline_kind(self.pos).is_some_and(|k| matches!(k, TokenKind::AmpAmp)) {
+        while self
+            .next_non_newline_kind(self.pos)
+            .is_some_and(|k| matches!(k, TokenKind::AmpAmp))
+        {
             self.consume_newlines();
             self.advance();
             self.consume_newlines();
@@ -1504,7 +1506,10 @@ impl Parser {
 
     fn parse_bitwise_or(&mut self) -> Result<Expr, CompileError> {
         let mut expr = self.parse_bitwise_xor()?;
-        while self.next_non_newline_kind(self.pos).is_some_and(|k| matches!(k, TokenKind::Pipe)) {
+        while self
+            .next_non_newline_kind(self.pos)
+            .is_some_and(|k| matches!(k, TokenKind::Pipe))
+        {
             self.consume_newlines();
             self.advance();
             self.consume_newlines();
@@ -1520,7 +1525,10 @@ impl Parser {
 
     fn parse_bitwise_xor(&mut self) -> Result<Expr, CompileError> {
         let mut expr = self.parse_bitwise_and()?;
-        while self.next_non_newline_kind(self.pos).is_some_and(|k| matches!(k, TokenKind::Caret)) {
+        while self
+            .next_non_newline_kind(self.pos)
+            .is_some_and(|k| matches!(k, TokenKind::Caret))
+        {
             self.consume_newlines();
             self.advance();
             self.consume_newlines();
@@ -1536,7 +1544,10 @@ impl Parser {
 
     fn parse_bitwise_and(&mut self) -> Result<Expr, CompileError> {
         let mut expr = self.parse_equality()?;
-        while self.next_non_newline_kind(self.pos).is_some_and(|k| matches!(k, TokenKind::Amp)) {
+        while self
+            .next_non_newline_kind(self.pos)
+            .is_some_and(|k| matches!(k, TokenKind::Amp))
+        {
             self.consume_newlines();
             self.advance();
             self.consume_newlines();
@@ -1552,7 +1563,9 @@ impl Parser {
 
     fn parse_equality(&mut self) -> Result<Expr, CompileError> {
         let mut expr = self.parse_comparison()?;
-        while self.next_non_newline_kind(self.pos).is_some_and(|k| matches!(k, TokenKind::EqualEqual | TokenKind::BangEqual))
+        while self
+            .next_non_newline_kind(self.pos)
+            .is_some_and(|k| matches!(k, TokenKind::EqualEqual | TokenKind::BangEqual))
         {
             self.consume_newlines();
             let op = if self.check_simple(&TokenKind::EqualEqual) {

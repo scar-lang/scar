@@ -1892,9 +1892,18 @@ fn infer_expr_type(
                 .or_else(|| types.get(name).map(|type_info| Type::Named(name.clone())))
                 .ok_or_else(|| {
                     eprintln!("[DEBUG sema unknown name] name={:?}", name);
-                    eprintln!("[DEBUG sema unknown name] scope keys: {:?}", scope.keys().collect::<Vec<_>>());
-                    eprintln!("[DEBUG sema unknown name] function keys: {:?}", functions.keys().collect::<Vec<_>>());
-                    eprintln!("[DEBUG sema unknown name] type keys: {:?}", types.keys().collect::<Vec<_>>());
+                    eprintln!(
+                        "[DEBUG sema unknown name] scope keys: {:?}",
+                        scope.keys().collect::<Vec<_>>()
+                    );
+                    eprintln!(
+                        "[DEBUG sema unknown name] function keys: {:?}",
+                        functions.keys().collect::<Vec<_>>()
+                    );
+                    eprintln!(
+                        "[DEBUG sema unknown name] type keys: {:?}",
+                        types.keys().collect::<Vec<_>>()
+                    );
                     CompileError::new(format!("unknown name `{name}`"))
                 }),
             [type_name, variant_name] => {
