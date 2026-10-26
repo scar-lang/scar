@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            os: macos-15
+            binary: scar
+          - name: linux-x86_64
+            os: ubuntu-latest
+            binary: scar
+          - name: windows-x86_64
+            os: windows-latest
+            binary: scar.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build compiler
+        run: cargo build --release
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="scar-${{ matrix.name }}"
+          mkdir -p "$archive/lib"
+          cp "target/release/${{ matrix.binary }}" "$archive/"
+          cp -R lib/std "$archive/lib/std"
+          cp README.md LICENSE "$archive/"
+          zip -r "$archive.zip" "$archive"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "scar-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path "$archive/lib" | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}" "$archive/"
+          Copy-Item -Recurse "lib/std" "$archive/lib/std"
+          Copy-Item README.md, LICENSE "$archive/"
+          Compress-Archive -Path $archive -DestinationPath "$archive.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scar-${{ matrix.name }}
+          path: scar-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

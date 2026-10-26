@@ -374,10 +374,8 @@ impl<'a> Backend<'a> {
         }
         builder.finalize();
         if self.capture_ir {
-            self.ir.push(format!(
-                "; scar function `main`\n{}",
-                ctx.func.display()
-            ));
+            self.ir
+                .push(format!("; scar function `main`\n{}", ctx.func.display()));
         }
         self.module
             .define_function(main_id, &mut ctx)

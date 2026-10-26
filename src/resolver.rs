@@ -24,6 +24,7 @@ pub fn resolve_entry_program(entry: &Path) -> Result<Program, CompileError> {
     let mut resolver = Resolver {
         root_dir,
         local_std_root: discover_local_std_root()?,
+        exe_std_root: discover_exe_std_root()?,
         home_std_root: discover_home_std_root()?,
         cache: HashMap::new(),
         emitted_modules: HashSet::new(),
@@ -151,6 +152,7 @@ type ModuleAliases = HashMap<String, ModuleExports>;
 struct Resolver {
     root_dir: PathBuf,
     local_std_root: Option<PathBuf>,
+    exe_std_root: Option<PathBuf>,
     home_std_root: Option<PathBuf>,
     cache: HashMap<PathBuf, ModuleExports>,
     emitted_modules: HashSet<PathBuf>,
@@ -183,6 +185,7 @@ impl Resolver {
                 current_dir,
                 &module_use.path,
                 self.local_std_root.as_deref(),
+                self.exe_std_root.as_deref(),
                 self.home_std_root.as_deref(),
             )?;
             let exports = self.resolve_module(&module_path)?;
@@ -337,6 +340,25 @@ fn discover_local_std_root() -> Result<Option<PathBuf>, CompileError> {
     }
 }
 
+fn discover_exe_std_root() -> Result<Option<PathBuf>, CompileError> {
+    let Ok(exe) = env::current_exe() else {
+        return Ok(None);
+    };
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+    let Some(exe_dir) = exe.parent() else {
+        return Ok(None);
+    };
+    for candidate in [
+        exe_dir.join("lib").join("std"),
+        exe_dir.join("..").join("lib").join("std"),
+    ] {
+        if candidate.is_dir() {
+            return Ok(Some(canonicalize_path(&candidate)?));
+        }
+    }
+    Ok(None)
+}
+
 fn discover_home_std_root() -> Result<Option<PathBuf>, CompileError> {
     let Some(home) = env::var_os("HOME") else {
         return Ok(None);
@@ -353,6 +375,7 @@ fn resolve_module_use_path(
     current_dir: &Path,
     module_path: &str,
     local_std_root: Option<&Path>,
+    exe_std_root: Option<&Path>,
     home_std_root: Option<&Path>,
 ) -> Result<PathBuf, CompileError> {
     fn check_path(base: &Path) -> Result<Option<PathBuf>, CompileError> {
@@ -386,6 +409,12 @@ fn resolve_module_use_path(
                 return Ok(path);
             }
         }
+        if let Some(exe_std_root) = exe_std_root {
+            let base = exe_std_root.join(rest);
+            if let Some(path) = check_path(&base)? {
+                return Ok(path);
+            }
+        }
         if let Some(home_std_root) = home_std_root {
             let base = home_std_root.join(rest);
             if let Some(path) = check_path(&base)? {
@@ -395,6 +424,8 @@ fn resolve_module_use_path(
 
         if let Some(local_std_root) = local_std_root {
             return Ok(local_std_root.join(rest).with_extension("scar"));
+        } else if let Some(exe_std_root) = exe_std_root {
+            return Ok(exe_std_root.join(rest).with_extension("scar"));
         } else if let Some(home_std_root) = home_std_root {
             return Ok(home_std_root.join(rest).with_extension("scar"));
         }
@@ -3960,6 +3991,7 @@ mod tests {
             Path::new("/project/src"),
             "std/string",
             Some(Path::new("/project/lib/std")),
+            Some(Path::new("/opt/scar/lib/std")),
             Some(Path::new("/home/test/.scar/lib/std")),
         )
         .unwrap();
@@ -3968,10 +4000,25 @@ mod tests {
     }
 
     #[test]
+    fn std_imports_fall_back_to_exe_std_root() {
+        let resolved = resolve_module_use_path(
+            Path::new("/project/src"),
+            "std/string",
+            None,
+            Some(Path::new("/opt/scar/lib/std")),
+            Some(Path::new("/home/test/.scar/lib/std")),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, Path::new("/opt/scar/lib/std/string.scar"));
+    }
+
+    #[test]
     fn std_imports_fall_back_to_home_std_root() {
         let resolved = resolve_module_use_path(
             Path::new("/project/src"),
             "std/string",
+            None,
             None,
             Some(Path::new("/home/test/.scar/lib/std")),
         )
@@ -3986,6 +4033,7 @@ mod tests {
             Path::new("/project/src"),
             "some_file",
             Some(Path::new("/project/lib/std")),
+            Some(Path::new("/opt/scar/lib/std")),
             Some(Path::new("/home/test/.scar/lib/std")),
         )
         .unwrap();

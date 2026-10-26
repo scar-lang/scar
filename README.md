@@ -5,17 +5,26 @@ General purpose systems programming language with a high-level, ruby-like syntax
 #### Example
 
 ```scar
-def add[T](x: T, y: T) T
-	return x + y
+type Pair[T, U]
+	first T
+	second U
 end
 
-def mix_add[A: i32|i64, B: f32|f64, C: f64](x: A, y: B) C
-	return (x as C) + (y as C)
+def make_pair[T, U](first T, second U) Pair[T, U]
+	return Pair[T, U](first: first, second: second)
 end
 
-pub def main()
-	@print("{d}\n", add[i32](120, 140))
-	@print("{lf}\n", mix_add[i32, f32, f64](1, 2.0))
+def swap[T, U](pair Pair[T, U]) Pair[U, T]
+	return Pair[U, T](first: pair.second, second: pair.first)
+end
+
+def add[T: i32|i64|f32|f64](a T, b T) T
+	return a + b
+end
+
+pub def main() void
+	val pair = swap[i32, ref(u8)](make_pair[i32, ref(u8)](42, "scar"))
+	@print("{d} {s}\n", {add[i32](pair.second, 8)}, {pair.first})
 end
 ```
 
