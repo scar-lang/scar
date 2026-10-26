@@ -1,6 +1,9 @@
 val str = use("std/string")
 val allocators = use("std/allocators")
 
+val SCALE i64 = 1000
+val ESCAPE i64 = 4000000
+
 type Complex
     re i64
     im i64
@@ -22,8 +25,8 @@ end
 
 def c_mul(a Complex, b Complex) Complex
     return Complex(
-        re: (a.re * b.re - a.im * b.im),
-        im: (a.re * b.im + a.im * b.re)
+        re: (a.re * b.re - a.im * b.im) / SCALE,
+        im: (a.re * b.im + a.im * b.re) / SCALE
     )
 end
 
@@ -35,7 +38,7 @@ def mandelbrot_iter(c Complex, max_iter i32) i32
     var z = make_complex(0, 0)
 
     for var i = 0 .. max_iter
-        if c_mag2(z) > 4
+        if c_mag2(z) > ESCAPE
             return i
         end
 
@@ -45,34 +48,49 @@ def mandelbrot_iter(c Complex, max_iter i32) i32
     return max_iter
 end
 
+def ascii_for(iter i32, max_iter i32) ref(u8)
+    if iter == max_iter
+        return "@"
+    end
+    if iter > 80
+        return "%"
+    end
+    if iter > 60
+        return "#"
+    end
+    if iter > 40
+        return "*"
+    end
+    if iter > 25
+        return "+"
+    end
+    if iter > 12
+        return "="
+    end
+    if iter > 5
+        return "-"
+    end
+    if iter > 1
+        return ":"
+    end
+    return "."
+end
+
 def render_mandelbrot(width i32, height i32, max_iter i32) void|error
     var ac = allocators.Arena.new(8192 as usize)?
     defer
         allocators.Arena.destroy(@addr(ac))
     end
+
     for var iy = 0 .. height
         var line = ""
 
         for var ix = 0 .. width
-            var re = ((ix * 3) - (width * 2)) as i64
-            var im = ((iy * 2) - (height)) as i64
+            val re = ((ix * 3500) / width - 2200) as i64
+            val im = ((iy * 2400) / height - 1200) as i64
+            val iter = mandelbrot_iter(make_complex(re, im), max_iter)
 
-            var c = make_complex(re, im)
-            var iter = mandelbrot_iter(c, max_iter)
-
-            if iter == max_iter
-                line = str.rconcat[_](ac, line, "#")?
-            else
-                if iter > (max_iter / 2)
-                    line = str.rconcat[_](ac, line, "*")?
-                else
-                    if iter > (max_iter / 4)
-                        line = str.rconcat[_](ac, line, "+")?
-                    else
-                        line = str.rconcat[_](ac, line, ".")?
-                    end
-                end
-            end
+            line = str.rconcat[_](ac, line, ascii_for(iter, max_iter))?
         end
 
         @puts(line)
@@ -83,7 +101,7 @@ end
 pub def main() void
     @puts("mandelbrot starting...")
 
-    render_mandelbrot(80, 40, 60)
+    render_mandelbrot(80, 40, 100)
 
     @puts("done")
 end
