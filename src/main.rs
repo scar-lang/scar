@@ -156,6 +156,7 @@ fn run(cli: &Cli) -> Result<(), CompileErrors> {
         Cli::Build(cli) => run_build(cli),
         Cli::Wasm(cli) => run_wasm_command(cli),
         Cli::Ast(cli) => run_ast_command(cli),
+        Cli::Inspect(cli) => run_inspect_command(cli),
         Cli::Run(cli) => run_run_command(cli),
         Cli::Test(cli) => run_test_command(cli),
         Cli::Help => {
@@ -186,6 +187,7 @@ fn print_help() {
     println!("  build <file.scar>    Build a native executable");
     println!("  wasm  <file.scar>    Compile to WebAssembly");
     println!("  ast   <file.scar>    Print the parsed AST");
+    println!("  inspect <file.scar>  Print the Cranelift IR");
     println!("  run   <file.scar>    Compile and run a program");
     println!("  test  <file|dir>     Run test blocks");
     println!("  help                 Show this help message");
@@ -207,6 +209,7 @@ enum Cli {
     Build(BuildCli),
     Wasm(WasmCli),
     Ast(AstCli),
+    Inspect(InspectCli),
     Run(RunCli),
     Test(TestCli),
     Help,
@@ -223,6 +226,7 @@ impl Cli {
             "build" => Ok(Self::Build(BuildCli::parse(args.into_iter().skip(1))?)),
             "wasm" => Ok(Self::Wasm(WasmCli::parse(args.into_iter().skip(1))?)),
             "ast" => Ok(Self::Ast(AstCli::parse(args.into_iter().skip(1))?)),
+            "inspect" => Ok(Self::Inspect(InspectCli::parse(args.into_iter().skip(1))?)),
             "run" => Ok(Self::Run(RunCli::parse(args.into_iter().skip(1))?)),
             "test" => Ok(Self::Test(TestCli::parse(args.into_iter().skip(1))?)),
             "help" | "-h" | "--help" => Ok(Self::Help),
@@ -237,6 +241,7 @@ impl Cli {
             Cli::Build(cli) => Some(&cli.input),
             Cli::Wasm(cli) => Some(&cli.input),
             Cli::Ast(cli) => Some(&cli.input),
+            Cli::Inspect(cli) => Some(&cli.input),
             Cli::Run(cli) => Some(&cli.input),
             Cli::Test(cli) => Some(&cli.target),
             Cli::Help | Cli::Version => None,
@@ -382,6 +387,41 @@ impl AstCli {
         }
         Ok(Self {
             input: input.ok_or_else(|| CompileError::new("usage: scar ast <input.scar>"))?,
+        })
+    }
+}
+
+struct InspectCli {
+    input: PathBuf,
+    optimize: bool,
+}
+
+impl InspectCli {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, CompileError> {
+        let mut input = None;
+        let mut optimize = false;
+
+        for arg in args {
+            match arg.as_str() {
+                "-opt" | "--opt" => optimize = true,
+                _ if arg.starts_with('-') => {
+                    return Err(CompileError::new(format!("unknown flag: {arg}")));
+                }
+                _ => {
+                    if input.is_some() {
+                        return Err(CompileError::new(
+                            "expected a single input file after `scar inspect`",
+                        ));
+                    }
+                    input = Some(PathBuf::from(arg));
+                }
+            }
+        }
+
+        Ok(Self {
+            input: input
+                .ok_or_else(|| CompileError::new("usage: scar inspect <input.scar> [-opt]"))?,
+            optimize,
         })
     }
 }
@@ -549,6 +589,17 @@ fn run_ast_command(cli: &AstCli) -> Result<(), CompileErrors> {
     let tokens = lex(&source).map_err(CompileErrors::single)?;
     let program = parse_program(tokens).map_err(CompileErrors::single)?;
     println!("{program:#?}");
+    Ok(())
+}
+
+fn run_inspect_command(cli: &InspectCli) -> Result<(), CompileErrors> {
+    let program = resolve_entry_program(&cli.input).map_err(CompileErrors::single)?;
+    let info = analyze(&program)?;
+    let ir = clif::compile_ir(&program, &info, cli.optimize).map_err(CompileErrors::single)?;
+    print!("{ir}");
+    if !ir.ends_with('\n') {
+        println!();
+    }
     Ok(())
 }
 
@@ -1288,8 +1339,8 @@ fn parse_location_suffix(message: &str) -> Option<(&str, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AstCli, Cli, CompilerKind, RunCli, TestCli, WasmCli, choose_compiler, default_output_path,
-        default_wasm_output_path,
+        AstCli, Cli, CompilerKind, InspectCli, RunCli, TestCli, WasmCli, choose_compiler,
+        default_output_path, default_wasm_output_path,
     };
     use std::{env, path::Path};
 
@@ -1384,6 +1435,24 @@ mod tests {
             panic!("expected ast cli");
         };
         assert_eq!(input, Path::new("main.scar"));
+    }
+
+    #[test]
+    fn cli_parses_inspect_subcommand() {
+        let cli = Cli::parse(
+            [
+                "inspect".to_string(),
+                "main.scar".to_string(),
+                "-opt".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Cli::Inspect(InspectCli { input, optimize }) = cli else {
+            panic!("expected inspect cli");
+        };
+        assert_eq!(input, Path::new("main.scar"));
+        assert!(optimize);
     }
 
     #[test]

@@ -30,6 +30,24 @@ pub fn compile_object(
     info: &ProgramInfo,
     optimize: bool,
 ) -> Result<NativeArtifact, CompileError> {
+    compile_internal(program, info, optimize, false).map(|(artifact, _)| artifact)
+}
+
+pub fn compile_ir(
+    program: &Program,
+    info: &ProgramInfo,
+    optimize: bool,
+) -> Result<String, CompileError> {
+    let (_, ir) = compile_internal(program, info, optimize, true)?;
+    Ok(ir.unwrap_or_default())
+}
+
+fn compile_internal(
+    program: &Program,
+    info: &ProgramInfo,
+    optimize: bool,
+    capture_ir: bool,
+) -> Result<(NativeArtifact, Option<String>), CompileError> {
     let mut flag_builder = settings::builder();
     flag_builder
         .set("opt_level", if optimize { "speed" } else { "none" })
@@ -67,6 +85,8 @@ pub fn compile_object(
         strings: HashMap::new(),
         next_data: 0,
         next_block: 0,
+        capture_ir,
+        ir: Vec::new(),
     };
 
     backend.declare_functions(program)?;
@@ -81,14 +101,22 @@ pub fn compile_object(
     }
     backend.define_entrypoint(program)?;
 
+    let ir = if capture_ir {
+        Some(backend.ir.join("\n\n"))
+    } else {
+        None
+    };
     let product = backend.module.finish();
     let object = product
         .emit()
         .map_err(|e| CompileError::new(format!("failed to emit native object: {e}")))?;
-    Ok(NativeArtifact {
-        object,
-        object_extension,
-    })
+    Ok((
+        NativeArtifact {
+            object,
+            object_extension,
+        },
+        ir,
+    ))
 }
 
 struct Backend<'a> {
@@ -102,6 +130,8 @@ struct Backend<'a> {
     strings: HashMap<String, (DataId, usize)>,
     next_data: usize,
     next_block: usize,
+    capture_ir: bool,
+    ir: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -343,6 +373,12 @@ impl<'a> Backend<'a> {
             builder.ins().return_(&[value]);
         }
         builder.finalize();
+        if self.capture_ir {
+            self.ir.push(format!(
+                "; scar function `main`\n{}",
+                ctx.func.display()
+            ));
+        }
         self.module
             .define_function(main_id, &mut ctx)
             .map_err(|e| CompileError::new(format!("failed to define C entrypoint: {e:?}")))?;
@@ -441,6 +477,13 @@ impl<'a> Backend<'a> {
         builder.ins().return_(&return_values);
         builder.seal_all_blocks();
         builder.finalize();
+        if self.capture_ir {
+            self.ir.push(format!(
+                "; scar function `{}`\n{}",
+                function.name,
+                ctx.func.display()
+            ));
+        }
         self.module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
@@ -2564,7 +2607,7 @@ impl<'a> Backend<'a> {
             });
         }
         if source.is_int() && target.is_int() {
-            return Ok(self.coerce_raw(builder, value, target));
+            return Ok(self.coerce_raw(builder, value, target, source_ty));
         }
         Ok(builder.ins().bitcast(target, MemFlags::new(), value))
     }
@@ -2581,7 +2624,7 @@ impl<'a> Backend<'a> {
             return Ok(value);
         }
         if source.is_int() && target.is_int() {
-            return Ok(self.coerce_raw(builder, value, target));
+            return Ok(self.coerce_raw(builder, value, target, ty));
         }
         if source.is_float() && target.is_float() {
             return Ok(if target == types::F32 {
@@ -2607,7 +2650,13 @@ impl<'a> Backend<'a> {
         Ok(value)
     }
 
-    fn coerce_raw(&self, builder: &mut FunctionBuilder, value: Value, target: ClifType) -> Value {
+    fn coerce_raw(
+        &self,
+        builder: &mut FunctionBuilder,
+        value: Value,
+        target: ClifType,
+        source_ty: &Type,
+    ) -> Value {
         let source = builder.func.dfg.value_type(value);
         if source == target || source.is_float() || target.is_float() {
             return value;
@@ -2615,7 +2664,11 @@ impl<'a> Backend<'a> {
         let source_bits = source.bits();
         let target_bits = target.bits();
         if source_bits < target_bits {
-            builder.ins().uextend(target, value)
+            if is_codegen_signed_integer_type(source_ty) {
+                builder.ins().sextend(target, value)
+            } else {
+                builder.ins().uextend(target, value)
+            }
         } else if source_bits > target_bits {
             builder.ins().ireduce(target, value)
         } else {
@@ -4410,4 +4463,33 @@ void scar_print_float(double value, int width, int mode) {
     }
 }
 "#
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{lexer::lex, parser::parse_program, sema::analyze};
+
+    use super::compile_ir;
+
+    fn compile_source(source: &str) -> String {
+        let tokens = lex(source).unwrap();
+        let program = parse_program(tokens).unwrap();
+        let info = analyze(&program).unwrap();
+        compile_ir(&program, &info, false).unwrap()
+    }
+
+    #[test]
+    fn widening_signed_casts_use_sign_extension() {
+        let ir =
+            compile_source("pub def main() void\n    @print(\"{d}\\n\", {(0 - 10) as i64})\nend\n");
+        assert!(ir.contains("sextend.i64"), "{ir}");
+    }
+
+    #[test]
+    fn widening_unsigned_casts_use_zero_extension() {
+        let ir = compile_source(
+            "pub def main() void\n    @print(\"{d}\\n\", {(10 as u32) as u64})\nend\n",
+        );
+        assert!(ir.contains("uextend.i64"), "{ir}");
+    }
 }
