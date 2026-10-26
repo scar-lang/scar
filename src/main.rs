@@ -184,19 +184,19 @@ fn print_help() {
     println!("Usage: scar <command> [options]");
     println!();
     println!("Commands:");
-    println!("  build <file.scar>    Build a native executable");
-    println!("  wasm  <file.scar>    Compile to WebAssembly");
-    println!("  ast   <file.scar>    Print the parsed AST");
-    println!("  inspect <file.scar>  Print the Cranelift IR");
-    println!("  run   <file.scar>    Compile and run a program");
-    println!("  test  <file|dir>     Run test blocks");
-    println!("  help                 Show this help message");
-    println!("  version              Show version information");
+    println!("  build   <file.scar>    Build a native executable");
+    println!("  wasm    <file.scar>    Compile to WebAssembly");
+    println!("  ast     <file.scar>    Print parsed AST");
+    println!("  inspect <file.scar>    Print CLIF IR");
+    println!("  run     <file.scar>    Compile and run a program");
+    println!("  test    <file|dir>     Run test blocks");
+    println!("  help                   Show this help message");
+    println!("  version                Show version information");
     println!();
     println!("Options:");
-    println!("  -o, --output <path>  Write output to <path>");
-    println!("  -opt, --opt          Enable optimizations");
-    println!("  -c                   Use the legacy native backend (build only)");
+    println!("  -o <path>              Write output to <path>");
+    println!("  -opt                   Enable optimizations");
+    println!("  -c                     Use legacy native backend (build only)");
 }
 
 #[derive(Debug, Clone, Copy)]
