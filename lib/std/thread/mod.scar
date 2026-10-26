@@ -87,23 +87,6 @@ when redox
 	end
 end
 
-when plan9
-	pub def sleep_ms(duration u64) void|error
-		return thread_error[void](
-			"std/thread is not supported on this platform yet"
-		)
-	end
-
-	pub def yield_now() void|error
-		return thread_error[void](
-			"std/thread is not supported on this platform yet"
-		)
-	end
-
-	pub def current_id() u64
-		return 0 as u64
-	end
-end
 
 test "thread helpers work"
 	val first u64 = current_id()

@@ -281,13 +281,6 @@ when redox
 	end
 end
 
-when plan9
-	pub def fill_random(buffer mut(ref(u8)), len usize) void|error
-		return crypto_error[void](
-			"std/crypto is not supported on this platform yet"
-		)
-	end
-end
 
 pub def random_u32() u32|error
 	var value u32 = 0 as u32

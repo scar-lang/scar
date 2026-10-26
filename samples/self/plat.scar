@@ -37,8 +37,5 @@ pub def main()
 	when redox
 		@puts("hellooo")
 	end
-	when plan9
-		@puts("hey")
-	end
 end
 

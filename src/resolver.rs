@@ -30,13 +30,11 @@ pub fn resolve_entry_program(entry: &Path) -> Result<Program, CompileError> {
         resolved_interfaces: Vec::new(),
         resolved_types: Vec::new(),
         resolved_typesets: Vec::new(),
-        resolved_enums: Vec::new(),
         resolved_functions: Vec::new(),
         resolved_globals: Vec::new(),
         resolved_extern_headers: Vec::new(),
         resolved_link_flags: Vec::new(),
         visiting: Vec::new(),
-        used_module_aliases: HashSet::new(),
     };
 
     USED_MODULE_ALIASES.with(|u| u.borrow_mut().clear());
@@ -159,13 +157,11 @@ struct Resolver {
     resolved_interfaces: Vec<InterfaceDef>,
     resolved_types: Vec<TypeDef>,
     resolved_typesets: Vec<TypeSetDef>,
-    resolved_enums: Vec<EnumDef>,
     resolved_functions: Vec<Function>,
     resolved_globals: Vec<GlobalVar>,
     resolved_extern_headers: Vec<String>,
     resolved_link_flags: Vec<String>,
     visiting: Vec<PathBuf>,
-    used_module_aliases: HashSet<String>,
 }
 
 impl Resolver {

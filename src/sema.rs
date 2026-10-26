@@ -1681,7 +1681,7 @@ fn analyze_stmt(
             var_name,
             init,
             condition,
-            increment,
+            increment: _,
             body,
             ..
         } => {
@@ -1889,23 +1889,8 @@ fn infer_expr_type(
                         Type::FnPtr(sig.params.clone(), Box::new(sig.return_type.clone()))
                     })
                 })
-                .or_else(|| types.get(name).map(|type_info| Type::Named(name.clone())))
-                .ok_or_else(|| {
-                    eprintln!("[DEBUG sema unknown name] name={:?}", name);
-                    eprintln!(
-                        "[DEBUG sema unknown name] scope keys: {:?}",
-                        scope.keys().collect::<Vec<_>>()
-                    );
-                    eprintln!(
-                        "[DEBUG sema unknown name] function keys: {:?}",
-                        functions.keys().collect::<Vec<_>>()
-                    );
-                    eprintln!(
-                        "[DEBUG sema unknown name] type keys: {:?}",
-                        types.keys().collect::<Vec<_>>()
-                    );
-                    CompileError::new(format!("unknown name `{name}`"))
-                }),
+                .or_else(|| types.get(name).map(|_type_info| Type::Named(name.clone())))
+                .ok_or_else(|| CompileError::new(format!("unknown name `{name}`"))),
             [type_name, variant_name] => {
                 if let Some(type_info) = types.get(type_name) {
                     if type_info.kind == TypeDefKind::Enum
@@ -2003,9 +1988,6 @@ fn infer_expr_type(
                 {
                     Ok(inner_ty)
                 }
-                UnaryOp::PostfixInc | UnaryOp::PostfixDec => Err(CompileError::new(
-                    "postfix increment/decrement requires a numeric operand",
-                )),
                 UnaryOp::PostfixInc | UnaryOp::PostfixDec => Err(CompileError::new(
                     "postfix increment/decrement requires a numeric operand",
                 )),

@@ -894,7 +894,7 @@ when windows
 	end
 end
 
-when plan9 | redox
+when redox
 	pub def exec(command ref(u8)) i32|error
 		return unsupported_os[i32]()
 	end

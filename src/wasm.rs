@@ -19,9 +19,6 @@ pub fn compile_wasm(
     _optimize: bool,
 ) -> Result<Vec<u8>, CompileError> {
     let wat = generate_wat(program, info)?;
-    if std::env::var_os("SCAR_DEBUG_WAT").is_some() {
-        eprintln!("{wat}");
-    }
     wat::parse_str(&wat)
         .map_err(|error| CompileError::new(format!("failed to encode wasm: {error}")))
 }

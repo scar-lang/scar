@@ -807,10 +807,6 @@ impl Lexer {
         self.chars.get(self.pos + 1).copied()
     }
 
-    fn peek_third(&self) -> Option<char> {
-        self.chars.get(self.pos + 2).copied()
-    }
-
     fn bump(&mut self) -> Option<char> {
         let ch = self.peek()?;
         self.pos += 1;

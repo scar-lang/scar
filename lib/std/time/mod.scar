@@ -365,27 +365,6 @@ when redox
 	end
 end
 
-when plan9
-	pub def now() i64|error
-		return unsupported_platform[i64]()
-	end
-
-	pub def epoch() i64|error
-		return unsupported_platform[i64]()
-	end
-
-	pub def clock_time() i64|error
-		return unsupported_platform[i64]()
-	end
-
-	pub def sleep_ms(milliseconds u64) void|error
-		return unsupported_platform[void]()
-	end
-
-	pub def sleep_seconds(seconds f64) void|error
-		return unsupported_platform[void]()
-	end
-end
 
 test "time functions work"
 	val start = clock_time()

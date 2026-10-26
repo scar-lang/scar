@@ -1143,7 +1143,7 @@ when windows
 	end
 end
 
-when redox | plan9
+when redox
 	pub def read_text[A: allocators.BumpAllocator](
 		ac ref(A),
 		path ref(u8)

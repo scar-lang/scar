@@ -9,7 +9,6 @@ pub enum Platform
 	Android
 	Haiku
 	Redox
-	Plan9
 	Unknown
 end
 
@@ -87,7 +86,6 @@ pub def current_platform_name[A: allocators.BumpAllocator](
 		Platform.Android      => ( return "android" )
 		Platform.Haiku        => ( return "haiku" )
 		Platform.Redox        => ( return "redox" )
-		Platform.Plan9        => ( return "plan9" )
 		Platform.Unknown      => ( return "unknown" )
 	end
 	return "unknown"
@@ -174,7 +172,6 @@ test "current_platform_name matches current platform"
 		Platform.Android =>	assert str.eql(name, "android")
 		Platform.Haiku => assert str.eql(name, "haiku")
 		Platform.Redox => assert str.eql(name, "redox")
-		Platform.Plan9 => assert str.eql(name, "plan9")
 		Platform.Unknown => assert str.eql(name, "unknown")
 	end
 

@@ -2471,7 +2471,6 @@ fn is_supported_platform_name(name: &str) -> bool {
             | "openbsd"
             | "netbsd"
             | "redox"
-            | "plan9"
             | "android"
             | "ios"
             | "posix"
@@ -2488,7 +2487,6 @@ fn platform_matches(name: &str) -> bool {
         "openbsd" => cfg!(target_os = "openbsd"),
         "netbsd" => cfg!(target_os = "netbsd"),
         "redox" => cfg!(target_os = "redox"),
-        "plan9" => cfg!(target_os = "plan9"),
         "android" => cfg!(target_os = "android"),
         "ios" => cfg!(target_os = "ios"),
         "posix" => cfg!(unix),

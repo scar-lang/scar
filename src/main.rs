@@ -142,8 +142,9 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(errors) => {
+            let default_path = cli.default_error_path();
             for error in &errors.errors {
-                eprintln!("{}", format_compile_error(error, None));
+                eprintln!("{}", format_compile_error(error, default_path));
             }
             ExitCode::FAILURE
         }
@@ -161,22 +162,39 @@ fn run(cli: &Cli) -> Result<(), CompileErrors> {
             print_help();
             Ok(())
         }
+        Cli::Version => {
+            print_version();
+            Ok(())
+        }
     }
 }
 
-fn print_help() {
+fn print_version() {
     println!(
-        "Scar compiler\n\
-\n\
-Usage:\n\
-  scar build <file.scar> [-opt] [-o output]   Build a native executable (Cranelift)\n\
-  scar build <file.scar> -c [-opt] [-o out]   Build using the legacy C backend\n\
-  scar wasm <file.scar> [-opt] [-o out.wasm]  Compile to WebAssembly\n\
-  scar ast <file.scar>                        Print the parsed AST\n\
-  scar run <file.scar>                        Compile and run a program\n\
-  scar test <file|dir> [-opt]                 Run test blocks\n\
-  scar help                                   Show this help message"
+        "scar v{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("SCAR_GIT_COMMIT")
     );
+}
+
+fn print_help() {
+    print_version();
+    println!("\n(C) Navid Momtahen - 2026\n");
+    println!("Usage: scar <command> [options]");
+    println!();
+    println!("Commands:");
+    println!("  build <file.scar>    Build a native executable via CLIF");
+    println!("  wasm  <file.scar>    Compile to WebAssembly");
+    println!("  ast   <file.scar>    Print the parsed AST");
+    println!("  run   <file.scar>    Compile and run a program");
+    println!("  test  <file|dir>     Run test blocks");
+    println!("  help                 Show this help message");
+    println!("  version              Show version information");
+    println!();
+    println!("Options:");
+    println!("  -o, --output <path>  Write output to <path>");
+    println!("  -opt, --opt          Enable optimizations");
+    println!("  -c                   Use the legacy native backend (build only)");
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +210,7 @@ enum Cli {
     Run(RunCli),
     Test(TestCli),
     Help,
+    Version,
 }
 
 impl Cli {
@@ -207,6 +226,7 @@ impl Cli {
             "run" => Ok(Self::Run(RunCli::parse(args.into_iter().skip(1))?)),
             "test" => Ok(Self::Test(TestCli::parse(args.into_iter().skip(1))?)),
             "help" | "-h" | "--help" => Ok(Self::Help),
+            "version" | "-V" | "--version" => Ok(Self::Version),
             _ if command.ends_with(".scar") => Ok(Self::Build(BuildCli::parse(args.into_iter())?)),
             _ => Ok(Self::Help),
         }
@@ -219,7 +239,7 @@ impl Cli {
             Cli::Ast(cli) => Some(&cli.input),
             Cli::Run(cli) => Some(&cli.input),
             Cli::Test(cli) => Some(&cli.target),
-            Cli::Help => None,
+            Cli::Help | Cli::Version => None,
         }
     }
 }
@@ -458,12 +478,6 @@ enum CompilerKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompileMode {
-    Standard,
-    FastRun,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompilerSpec {
     kind: CompilerKind,
     opt_flag: &'static str,
@@ -577,13 +591,7 @@ fn emit_program(
             let c_path = temporary_c_path(input);
             let result = (|| {
                 write_output(&c_path, &generated)?;
-                compile_c_to_binary(
-                    &c_path,
-                    output,
-                    optimize,
-                    CompileMode::Standard,
-                    &program.link_flags,
-                )
+                compile_c_to_binary(&c_path, output, optimize, &program.link_flags)
             })();
             let _ = fs::remove_file(&c_path);
             result?;
@@ -594,9 +602,6 @@ fn emit_program(
     match compile_native_to_binary(program, info, output, optimize) {
         Ok(()) => Ok(()),
         Err(native_error) => {
-            if env::var_os("SCAR_DEBUG_BACKEND").is_some() {
-                eprintln!("scar: native backend fallback: {native_error}");
-            }
             let generated = generate_c(program, info, !optimize).map_err(|c_error| {
                 CompileError::new(format!(
                     "native backend failed ({native_error}); C fallback failed ({c_error})"
@@ -605,13 +610,7 @@ fn emit_program(
             let c_path = temporary_c_path(input);
             let result = (|| {
                 write_output(&c_path, &generated)?;
-                compile_c_to_binary(
-                    &c_path,
-                    output,
-                    optimize,
-                    CompileMode::Standard,
-                    &program.link_flags,
-                )
+                compile_c_to_binary(&c_path, output, optimize, &program.link_flags)
             })();
             let _ = fs::remove_file(&c_path);
             result
@@ -853,13 +852,7 @@ fn run_tests_in_file(path: &Path, cli: &TestCli) -> Result<usize, CompileErrors>
 
     let result = (|| {
         write_output(&c_path, &generated)?;
-        compile_c_to_binary(
-            &c_path,
-            &binary_path,
-            cli.optimize,
-            CompileMode::Standard,
-            &runner.link_flags,
-        )?;
+        compile_c_to_binary(&c_path, &binary_path, cli.optimize, &runner.link_flags)?;
         run_test_binary(&binary_path)?;
         Ok(())
     })();
@@ -1012,7 +1005,6 @@ fn compile_c_to_binary(
     c_path: &Path,
     output_path: &Path,
     optimize: bool,
-    mode: CompileMode,
     link_flags: &[String],
 ) -> Result<(), CompileError> {
     if let Some(parent) = output_path
@@ -1043,7 +1035,6 @@ fn compile_c_to_binary(
         .arg("-std=c99")
         .arg(use_flag)
         .arg(compiler.opt_flag)
-        .args(extra_compiler_flags(compiler.kind, mode))
         .arg(c_path)
         .arg("-o")
         .arg(output_path)
@@ -1063,13 +1054,6 @@ fn compile_c_to_binary(
             "{compiler_name} failed to link {}",
             c_path.display()
         )))
-    }
-}
-
-fn extra_compiler_flags(kind: CompilerKind, mode: CompileMode) -> &'static [&'static str] {
-    match (kind, mode) {
-        (CompilerKind::Clang, CompileMode::FastRun) => &["-pipe"],
-        _ => &[],
     }
 }
 
@@ -1304,8 +1288,8 @@ fn parse_location_suffix(message: &str) -> Option<(&str, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AstCli, Cli, CompileMode, CompilerKind, RunCli, TestCli, WasmCli, choose_compiler,
-        default_output_path, default_wasm_output_path, extra_compiler_flags,
+        AstCli, Cli, CompilerKind, RunCli, TestCli, WasmCli, choose_compiler, default_output_path,
+        default_wasm_output_path,
     };
     use std::{env, path::Path};
 
@@ -1486,12 +1470,14 @@ mod tests {
     }
 
     #[test]
-    fn fast_run_adds_pipe_for_clang() {
-        assert_eq!(
-            extra_compiler_flags(CompilerKind::Clang, CompileMode::FastRun),
-            ["-pipe"]
-        );
-        assert!(extra_compiler_flags(CompilerKind::Tcc, CompileMode::FastRun).is_empty());
-        assert!(extra_compiler_flags(CompilerKind::Clang, CompileMode::Standard).is_empty());
+    fn cli_parses_version_subcommand() {
+        assert!(matches!(
+            Cli::parse(["version".to_string()].into_iter()).unwrap(),
+            Cli::Version
+        ));
+        assert!(matches!(
+            Cli::parse(["-V".to_string()].into_iter()).unwrap(),
+            Cli::Version
+        ));
     }
 }
